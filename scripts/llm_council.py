@@ -31,6 +31,7 @@ CODEX_MODEL = "gpt-5.2-codex"
 CODEX_REASONING = "xhigh"
 CLAUDE_MODEL = "opus"
 GEMINI_MODEL = "gemini-3-pro-preview"
+GROK_MODEL = "grok-code-fast-1"
 
 PROFILE_SETTINGS: Dict[str, Dict[str, Any]] = {
     "fast": {
@@ -76,6 +77,7 @@ RECOMMENDED_MODELS: Dict[str, List[str]] = {
     "codex": ["gpt-5.2-codex", "gpt-5-codex"],
     "claude": ["opus", "sonnet"],
     "gemini": ["gemini-3-pro-preview", "gemini-2.5-pro"],
+    "grok": ["grok-code-fast-1", "grok-4"],
     "opencode": ["openai/gpt-5.2-codex", "anthropic/claude-sonnet-4-5"],
 }
 WORKFLOW_CHOICES: Tuple[str, ...] = tuple(WORKFLOW_SETTINGS.keys())
@@ -235,6 +237,25 @@ def extract_agent_response(config: AgentConfig, raw: str) -> str:
                         return item["text"]
         return raw
 
+    if kind == "grok":
+        envelope = extract_json(raw)
+        if envelope is None:
+            try:
+                envelope = json.loads(raw)
+            except json.JSONDecodeError:
+                return raw
+        if isinstance(envelope, dict):
+            for key in ("response", "completion", "content", "output", "text", "message"):
+                value = envelope.get(key)
+                if isinstance(value, str):
+                    return value
+            content = envelope.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and isinstance(item.get("text"), str):
+                        return item["text"]
+        return raw
+
     if kind == "opencode":
         # Prefer OpenCode JSON event stream output when --format json is used.
         text_parts: List[str] = []
@@ -319,6 +340,13 @@ def _build_command_and_input(config: AgentConfig, prompt: str) -> Tuple[List[str
             args,
             None,
         )
+    if kind == "grok":
+        model = config.model or GROK_MODEL
+        args = ["grok", "-p", prompt, "--output-format", "json"]
+        if model:
+            args.extend(["-m", model])
+        args.extend(config.extra_args)
+        return (args, None)
     if kind == "claude":
         model = config.model or CLAUDE_MODEL
         args = [
@@ -1281,6 +1309,7 @@ def _agent_kind_display(kind: str) -> str:
         "codex": "OpenAI",
         "claude": "Anthropic",
         "gemini": "Google",
+        "grok": "xAI (Grok)",
         "opencode": "OpenCode",
         "custom": "Custom",
     }
@@ -1292,6 +1321,7 @@ def _default_api_env_var(kind: str) -> str:
         "codex": "OPENAI_API_KEY",
         "claude": "ANTHROPIC_API_KEY",
         "gemini": "GEMINI_API_KEY",
+        "grok": "XAI_API_KEY",
         "opencode": "OPENCODE_API_KEY",
         "custom": "CUSTOM_AGENT_API_KEY",
     }
@@ -1305,6 +1335,49 @@ def _save_agents_config(config_path: Path, payload: Dict[str, Any]) -> None:
     write_json(str(tmp_path), payload)
     os.replace(tmp_path, config_path)
     print("Saved.")
+
+
+def _default_task_spec_candidate() -> Optional[Path]:
+    candidates = [
+        Path.cwd() / "references" / "task-spec.example.json",
+        Path(__file__).resolve().parent.parent / "references" / "task-spec.example.json",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def _launch_after_config(config_path: Path) -> None:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return
+    script_path = Path(__file__).resolve()
+    default_spec = _default_task_spec_candidate()
+    if default_spec is not None:
+        spec_path = default_spec
+        print(f"\nLaunching council automatically with spec: {spec_path}")
+    else:
+        raw = input(
+            "\nWizard complete. Enter task spec path to launch now (blank to skip): "
+        ).strip()
+        if not raw:
+            print("No spec path provided. Skipping auto-launch.")
+            return
+        spec_path = Path(raw).expanduser()
+    if not spec_path.exists():
+        print(f"Spec file not found: {spec_path}. Skipping auto-launch.")
+        return
+    command = [
+        sys.executable,
+        str(script_path),
+        "run",
+        "--spec",
+        str(spec_path),
+        "--config",
+        str(config_path),
+    ]
+    print(f"Running: {' '.join(shlex.quote(item) for item in command)}")
+    subprocess.run(command, check=False)
 
 
 def _configure_agents_prompt(config_path: Path) -> None:
@@ -1364,11 +1437,12 @@ def _configure_agents_prompt(config_path: Path) -> None:
         planners = []
         for idx in range(1, planner_count + 1):
             print(f"\nPlanner {idx}")
-            kinds = ["codex", "claude", "gemini", "opencode", "custom"]
+            kinds = ["codex", "claude", "gemini", "grok", "opencode", "custom"]
             labels = {
                 "codex": "OpenAI",
                 "claude": "Anthropic",
                 "gemini": "Google",
+                "grok": "xAI (Grok)",
                 "opencode": "OpenCode",
                 "custom": "Custom command",
             }
@@ -1388,6 +1462,8 @@ def _configure_agents_prompt(config_path: Path) -> None:
                 planner["model"] = prompt_model("claude", CLAUDE_MODEL)
             elif kind == "gemini":
                 planner["model"] = prompt_model("gemini", GEMINI_MODEL)
+            elif kind == "grok":
+                planner["model"] = prompt_model("grok", GROK_MODEL)
             elif kind == "opencode":
                 print(
                     "Opencode provider/model (note: run 'opencode models' in another terminal to see available models)"
@@ -1465,6 +1541,7 @@ def _configure_agents_prompt(config_path: Path) -> None:
 
     payload = {"planners": planners, "judge": judge, "runtime_defaults": runtime_defaults}
     _save_agents_config(config_path, payload)
+    _launch_after_config(config_path)
 
 
 def _supports_setup_tui() -> bool:
@@ -1483,6 +1560,7 @@ def _configure_agents_tui(config_path: Path) -> None:
         ("codex", "OpenAI"),
         ("claude", "Anthropic"),
         ("gemini", "Google"),
+        ("grok", "xAI (Grok)"),
         ("opencode", "OpenCode"),
         ("custom", "Custom command"),
     ]
@@ -1736,6 +1814,14 @@ def _configure_agents_tui(config_path: Path) -> None:
                         default=GEMINI_MODEL,
                         allow_empty=False,
                     )
+                elif kind == "grok":
+                    planner["model"] = _input_text(
+                        stdscr,
+                        f"Planner {idx} Model",
+                        "xAI model",
+                        default=GROK_MODEL,
+                        allow_empty=False,
+                    )
                 elif kind == "opencode":
                     planner["model"] = _input_text(
                         stdscr,
@@ -1889,6 +1975,7 @@ def _configure_agents_tui(config_path: Path) -> None:
         print("Setup cancelled.")
         return
     _save_agents_config(config_path, payload)
+    _launch_after_config(config_path)
 
 
 def configure_agents(config_path: Path) -> None:
@@ -2460,7 +2547,7 @@ def run_agent_checks(
 
 def _agent_command_name(config: AgentConfig) -> Optional[str]:
     kind = (config.kind or "").lower()
-    if kind in ("codex", "claude", "gemini", "opencode"):
+    if kind in ("codex", "claude", "gemini", "grok", "opencode"):
         return kind
     if config.command:
         parts = shlex.split(config.command)

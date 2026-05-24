@@ -1,6 +1,6 @@
 # LLM Council
 
-Multi-agent planning orchestrator for AI CLIs (Codex, Claude, Gemini, OpenCode, or custom commands).
+Multi-agent planning orchestrator for AI CLIs (OpenAI/Codex, Anthropic/Claude, Google/Gemini, xAI/Grok, OpenCode, or custom commands).
 
 `llm-council` runs multiple planner agents in parallel, anonymizes and randomizes their plans, then uses a judge agent to produce a final plan. It also includes a local minimalist UI for live status, runtime tuning, and post-run refine/accept workflows.
 
@@ -35,7 +35,8 @@ From repo root:
 
 1. Check/install core dependencies (`python3`, `git`, `curl`, `node`, `npm`)
 2. Attempt to install AI CLIs (`codex`, `claude`, `gemini`, `opencode`) via package manager and/or npm
-3. Launch interactive configuration
+3. Launch interactive configuration wizard
+4. Auto-launch a run after wizard save (uses local `references/task-spec.example.json` when available)
 
 Then run a task:
 
@@ -132,6 +133,12 @@ Minimal:
 See full example:
 
 - `references/task-spec.example.json`
+
+## Provider notes
+
+- **OpenAI / Anthropic / Google / OpenCode / xAI (Grok)** are available in the setup wizard.
+- Choosing **xAI (Grok)** expects a working `grok` CLI in `PATH`.
+- For API mode with Grok, use `XAI_API_KEY` (or your custom env var name from setup).
 
 ## Output artifacts
 

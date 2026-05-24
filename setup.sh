@@ -237,6 +237,11 @@ fi
 if ! has_cmd opencode; then
   try_npm_install opencode "opencode-ai" || agent_failures=$((agent_failures + 1))
 fi
+if has_cmd grok; then
+  log "grok found"
+else
+  warn "grok not found. Install Grok CLI from xAI docs if you want to use xAI (Grok) provider."
+fi
 
 if [[ "$agent_failures" -gt 0 ]]; then
   warn "$agent_failures agent CLI tool(s) are still missing. You can continue with configure and use available/custom agents."

@@ -50,6 +50,26 @@ PROFILE_SETTINGS: Dict[str, Dict[str, Any]] = {
         "planner_hint": "Be thorough and explicit. Include more detailed reasoning.",
     },
 }
+WORKFLOW_SETTINGS: Dict[str, Dict[str, Any]] = {
+    "quick-decide": {
+        "profile": "fast",
+        "plan_only": True,
+        "min_valid_planners": 2,
+        "workflow_hint": "Prioritize speed and concise options.",
+    },
+    "full-council": {
+        "profile": "balanced",
+        "plan_only": False,
+        "min_valid_planners": 2,
+        "workflow_hint": "Balance quality and speed.",
+    },
+    "risk-review": {
+        "profile": "deep",
+        "plan_only": False,
+        "min_valid_planners": 3,
+        "workflow_hint": "Prioritize risk analysis and failure modes.",
+    },
+}
 RECOMMENDED_MODELS: Dict[str, List[str]] = {
     "codex": ["gpt-5.2-codex", "gpt-5-codex"],
     "claude": ["opus", "sonnet"],
@@ -1529,6 +1549,11 @@ def _profile_setting(profile: str, key: str, fallback: Any) -> Any:
     return values.get(key, fallback)
 
 
+def _workflow_setting(workflow: str, key: str, fallback: Any) -> Any:
+    values = WORKFLOW_SETTINGS.get(workflow, {})
+    return values.get(key, fallback)
+
+
 def _recommendation_for_result(result: AgentResult, config: AgentConfig) -> Optional[str]:
     if not result.error:
         return None
@@ -1538,6 +1563,71 @@ def _recommendation_for_result(result: AgentResult, config: AgentConfig) -> Opti
             return f"{config.name}: timed out on {model_label}. Try fallback model {config.fallback_models[0]}."
         return f"{config.name}: timed out on {model_label}. Consider a faster model or fast profile."
     return f"{config.name}: invalid output from {model_label}. Consider a more reliable model for structured plans."
+
+
+def _build_agent_check_prompt(
+    task_spec: Dict[str, Any],
+    final_plan: str,
+    judge_text: str,
+    alternatives: List[Dict[str, Any]],
+) -> str:
+    alt_section = "\n\n".join(
+        f"{item.get('label', 'Plan')}:\n{str(item.get('plan') or '')[:900]}" for item in alternatives[:3]
+    )
+    return (
+        "You are reviewing a judge decision in a multi-agent planning run.\n"
+        "Reply with exactly 4 short markdown bullets:\n"
+        "- Verdict: agree/disagree with one sentence\n"
+        "- Risk: one concrete risk\n"
+        "- Improvement: one concrete improvement\n"
+        "- Confidence: 1-5 with one sentence\n"
+        "Do not include anything else.\n\n"
+        f"Task brief:\n{build_task_brief(task_spec)}\n\n"
+        f"Judge report (excerpt):\n{judge_text[:1600]}\n\n"
+        f"Final plan:\n{final_plan[:2000]}\n\n"
+        f"Alternatives:\n{alt_section}\n"
+    )
+
+
+def run_agent_checks(
+    task_spec: Dict[str, Any],
+    planners: List[AgentConfig],
+    judge: AgentConfig,
+    final_plan: str,
+    judge_text: str,
+    alternatives: List[Dict[str, Any]],
+    timeout_sec: int,
+    run_dir: Path,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    checks: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    prompt = _build_agent_check_prompt(task_spec, final_plan, judge_text, alternatives)
+    reviewers = [agent for agent in planners if agent.name != judge.name]
+    if not reviewers:
+        return checks, warnings
+    for reviewer in reviewers:
+        try:
+            running = spawn_cli_agent(reviewer, prompt)
+            raw = collect_cli_output(running, timeout_sec)
+            text = extract_agent_response(reviewer, raw).strip()
+            if not text:
+                text = "No response."
+                warnings.append(f"{reviewer.name}: empty agent check response")
+            checks.append({"agent": reviewer.name, "kind": reviewer.kind, "response": text})
+            (run_dir / f"agent-check-{reviewer.name}.md").write_text(text, encoding="utf-8")
+        except TimeoutError:
+            warnings.append(f"{reviewer.name}: agent check timed out")
+            checks.append({"agent": reviewer.name, "kind": reviewer.kind, "response": "Timed out."})
+        except Exception as exc:
+            warnings.append(f"{reviewer.name}: agent check failed ({exc})")
+            checks.append({"agent": reviewer.name, "kind": reviewer.kind, "response": "Failed."})
+    if checks:
+        checks_md = []
+        for item in checks:
+            checks_md.append(f"## {item['agent']}\n\n{item['response']}\n")
+        (run_dir / "agent-checks.md").write_text("\n".join(checks_md), encoding="utf-8")
+        write_json(str(run_dir / "agent-checks.json"), checks)
+    return checks, warnings
 
 
 def _agent_command_name(config: AgentConfig) -> Optional[str]:
@@ -1614,20 +1704,32 @@ def main() -> int:
     run.add_argument("--seed", type=int, default=None)
     run.add_argument("--config", required=False, help="Path to agents config JSON")
     run.add_argument(
-        "--profile",
-        choices=["fast", "balanced", "deep"],
-        default="balanced",
-        help="Execution profile for timeouts, retries, and prompt depth",
+        "--workflow",
+        choices=["quick-decide", "full-council", "risk-review"],
+        default="full-council",
+        help="Workflow template controlling defaults for profile and planning mode",
     )
     run.add_argument(
+        "--profile",
+        choices=["fast", "balanced", "deep"],
+        default=None,
+        help="Execution profile for timeouts, retries, and prompt depth",
+    )
+    mode_group = run.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--plan-only",
         action="store_true",
         help="Run planners and shortlist only; skip judge and final synthesis",
     )
+    mode_group.add_argument(
+        "--full-run",
+        action="store_true",
+        help="Force full run even for quick-decide workflow",
+    )
     run.add_argument(
         "--min-valid-planners",
         type=int,
-        default=2,
+        default=None,
         help="Minimum number of valid planner outputs required to continue",
     )
     run.add_argument("--no-ui", action="store_true", help="Disable the live UI server")
@@ -1755,7 +1857,16 @@ def main() -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    min_valid_required = max(1, int(args.min_valid_planners))
+    workflow_name = args.workflow
+    profile_name = args.profile or str(_workflow_setting(workflow_name, "profile", "balanced"))
+    if profile_name not in PROFILE_SETTINGS:
+        print(f"Unknown profile: {profile_name}", file=sys.stderr)
+        return 2
+    plan_only_mode = args.plan_only
+    if not args.plan_only and not args.full_run and bool(_workflow_setting(workflow_name, "plan_only", False)):
+        plan_only_mode = True
+    min_valid_default = int(_workflow_setting(workflow_name, "min_valid_planners", 2))
+    min_valid_required = max(1, int(args.min_valid_planners if args.min_valid_planners is not None else min_valid_default))
     if min_valid_required > len(planners):
         print(
             f"min-valid-planners ({min_valid_required}) cannot exceed planner count ({len(planners)}).",
@@ -1766,11 +1877,13 @@ def main() -> int:
     if args.seed is not None:
         random.seed(args.seed)
 
-    profile_name = args.profile
     planner_timeout = int(min(args.timeout, _profile_setting(profile_name, "planner_timeout", DEFAULT_TIMEOUT_SEC)))
     judge_timeout = int(min(args.timeout, _profile_setting(profile_name, "judge_timeout", DEFAULT_TIMEOUT_SEC)))
     retry_limit = int(_profile_setting(profile_name, "retry_limit", RETRY_LIMIT))
     prompt_hint = str(_profile_setting(profile_name, "planner_hint", "Keep the plan concise but complete."))
+    workflow_hint = str(_workflow_setting(workflow_name, "workflow_hint", ""))
+    if workflow_hint:
+        prompt_hint = f"{prompt_hint} {workflow_hint}".strip()
 
     if ui_state:
         timestamp = _ui_timestamp()
@@ -1876,6 +1989,7 @@ def main() -> int:
     metadata = {
         "used_plans": [p["label"] for p in randomized_plans],
         "profile": profile_name,
+        "workflow": workflow_name,
         "timeouts": {"planner_sec": planner_timeout, "judge_sec": judge_timeout},
         "agents": {
             "planners": [planner.name for planner in planners],
@@ -1891,12 +2005,13 @@ def main() -> int:
         "warnings": [r.error for r in planner_results if r.error],
     }
 
-    if args.plan_only:
+    if plan_only_mode:
         _ui_set_phase(ui_state, ui_instance, "complete", _ui_timestamp())
         summary = {
             "mode": "plan-only",
             "run_dir": str(run_dir),
             "profile": profile_name,
+            "workflow": workflow_name,
             "valid_planners": len(valid_plans),
             "alternatives_json": str(run_dir / "alternatives.json"),
         }
@@ -1943,7 +2058,20 @@ def main() -> int:
     metadata["warnings"] = [r.error for r in planner_results if r.error] + ([judge_result.error] if judge_result.error else [])
 
     _ui_set_phase(ui_state, ui_instance, "finalizing", _ui_timestamp())
-    final_text = extract_final_plan(judge_result.data.get("text", "") if judge_result.data else "")
+    judge_text_full = judge_result.data.get("text", "") if judge_result.data else ""
+    final_text = extract_final_plan(judge_text_full)
+    agent_checks, agent_check_warnings = run_agent_checks(
+        task_spec=task_spec,
+        planners=planners,
+        judge=judge,
+        final_plan=final_text,
+        judge_text=judge_text_full,
+        alternatives=randomized_plans,
+        timeout_sec=max(60, judge_timeout // 2),
+        run_dir=run_dir,
+    )
+    if agent_check_warnings:
+        metadata["warnings"].extend(agent_check_warnings)
     final_path = run_dir / "final-plan.md"
     final_path.write_text(final_text, encoding="utf-8")
     write_json(str(run_dir / "run-metadata.json"), metadata)
@@ -1953,9 +2081,9 @@ def main() -> int:
             "metadata": metadata,
             "final_plan": final_text,
             "alternatives": randomized_plans,
-            "agent_checks": [],
+            "agent_checks": agent_checks,
             "recommendations": [],
-            "summary": {"mode": "full", "run_dir": str(run_dir), "profile": profile_name},
+            "summary": {"mode": "full", "run_dir": str(run_dir), "profile": profile_name, "workflow": workflow_name},
         },
     )
     _ui_set_final_plan(ui_state, ui_instance, final_text, _ui_timestamp())

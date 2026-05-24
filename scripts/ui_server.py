@@ -109,12 +109,18 @@ class _UIRequestHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/state":
+            if not self._validate_token(parsed):
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
             self._handle_state()
             return
         if parsed.path == "/events":
             self._handle_events(parsed)
             return
         if parsed.path == "/ui/state":
+            if not self._validate_token(parsed):
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
             self._handle_state()
             return
         if parsed.path == "/ui/events":

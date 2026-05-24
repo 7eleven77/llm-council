@@ -15,13 +15,15 @@ import time
 import threading
 from datetime import datetime, timedelta, timezone
 import webbrowser
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import ui_server
 
 RETRY_LIMIT = 2
 DEFAULT_TIMEOUT_SEC = 180
+MIN_TIMEOUT_SEC = 5
+MAX_TIMEOUT_SEC = 3600
 DEFAULT_UI_KEEPALIVE_SEC = 20 * 60
 DEFAULT_UI_SESSION_TTL_SEC = 30 * 60
 
@@ -382,10 +384,41 @@ def collect_cli_output(running: RunningAgent, timeout_sec: int) -> str:
     try:
         stdout, stderr = running.process.communicate(timeout=timeout_sec)
     except subprocess.TimeoutExpired as exc:
+        _kill_running_agent(running)
+        stdout, stderr = running.process.communicate()
+        raise TimeoutError(f"{running.config.name} timed out") from exc
+    combined = stdout or ""
+    if stderr:
+        combined = combined + "\n" + stderr
+    return combined
+
+
+def _kill_running_agent(running: RunningAgent) -> None:
+    try:
+        os.killpg(running.process.pid, signal.SIGKILL)
+    except OSError:
         try:
-            os.killpg(running.process.pid, signal.SIGKILL)
-        except OSError:
             running.process.kill()
+        except OSError:
+            pass
+
+
+def collect_cli_output_until(running: RunningAgent, deadline_monotonic: float) -> str:
+    remaining = deadline_monotonic - time.monotonic()
+    if remaining <= 0:
+        if running.process.poll() is not None:
+            stdout, stderr = running.process.communicate()
+            combined = stdout or ""
+            if stderr:
+                combined = combined + "\n" + stderr
+            return combined
+        _kill_running_agent(running)
+        running.process.communicate()
+        raise TimeoutError(f"{running.config.name} timed out")
+    try:
+        stdout, stderr = running.process.communicate(timeout=remaining)
+    except subprocess.TimeoutExpired as exc:
+        _kill_running_agent(running)
         stdout, stderr = running.process.communicate()
         raise TimeoutError(f"{running.config.name} timed out") from exc
     combined = stdout or ""
@@ -427,6 +460,21 @@ def validate_markdown_plan(text: str) -> Tuple[bool, Optional[str]]:
     missing = [header for header in required if header not in text]
     if missing:
         return False, "missing headers: " + ", ".join(missing)
+    section_requirements = {
+        "## Overview": 20,
+        "## Scope": 20,
+        "## Phases": 30,
+        "## Testing Strategy": 20,
+        "## Risks": 20,
+        "## Rollback Plan": 15,
+        "## Edge Cases": 15,
+    }
+    for heading, min_len in section_requirements.items():
+        body = _extract_markdown_section(text, heading)
+        if len(body.strip()) < min_len:
+            return False, f"section too short: {heading}"
+    if "### Phase" not in text:
+        return False, "phases section must contain at least one '### Phase' heading"
     return True, None
 
 
@@ -443,7 +491,32 @@ def validate_markdown_judge(text: str) -> Tuple[bool, Optional[str]]:
     missing = [header for header in required if header not in text]
     if missing:
         return False, "missing headers: " + ", ".join(missing)
+    section_requirements = {
+        "## Scores": 12,
+        "## Comparative Analysis": 20,
+        "## Missing Steps": 12,
+        "## Contradictions": 12,
+        "## Improvements": 12,
+    }
+    for heading, min_len in section_requirements.items():
+        body = _extract_markdown_section(text, heading)
+        if len(body.strip()) < min_len:
+            return False, f"section too short: {heading}"
+    final_plan_body = _extract_markdown_section(text, "## Final Plan")
+    if "# Plan" not in final_plan_body:
+        return False, "final plan section must include a '# Plan' block"
     return True, None
+
+
+def _extract_markdown_section(text: str, heading: str) -> str:
+    match = re.search(
+        rf"^{re.escape(heading)}\s*$\n(.*?)(?=^##\s|\Z)",
+        text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        return ""
+    return match.group(1).strip()
 
 
 def _ui_timestamp() -> str:
@@ -844,7 +917,12 @@ def _handle_ui_actions(
                 prompt = _build_refine_prompt(plan_template, task_brief, final_plan, context)
                 running = spawn_cli_agent(judge, prompt)
                 try:
-                    refine_timeout = _coerce_int(getattr(args, "timeout", DEFAULT_TIMEOUT_SEC), DEFAULT_TIMEOUT_SEC, minimum=30, maximum=3600)
+                    refine_timeout = _coerce_int(
+                        getattr(args, "timeout", DEFAULT_TIMEOUT_SEC),
+                        DEFAULT_TIMEOUT_SEC,
+                        minimum=MIN_TIMEOUT_SEC,
+                        maximum=MAX_TIMEOUT_SEC,
+                    )
                     raw = collect_cli_output(running, refine_timeout)
                 except TimeoutError as exc:
                     _ui_update_judge(
@@ -1039,7 +1117,14 @@ def resolve_path(relative_path: str) -> str:
 
 
 def get_run_root() -> Path:
-    return Path.cwd() / "llm-council" / "runs"
+    env_override = os.environ.get("LLM_COUNCIL_RUN_ROOT")
+    if env_override:
+        return Path(env_override).expanduser().resolve()
+    cwd = Path.cwd().resolve()
+    # If running from the llm-council repository root, avoid nested llm-council/llm-council/runs.
+    if (cwd / "scripts" / "llm_council.py").exists() and (cwd / "references").exists():
+        return cwd / "runs"
+    return cwd / "llm-council" / "runs"
 
 
 def slugify(value: str, max_len: int = 40) -> str:
@@ -1317,8 +1402,8 @@ def configure_agents(config_path: Path) -> None:
     timeout_default = _coerce_int(
         prompt_text("Max timeout seconds", str(DEFAULT_TIMEOUT_SEC)),
         DEFAULT_TIMEOUT_SEC,
-        minimum=30,
-        maximum=3600,
+        minimum=MIN_TIMEOUT_SEC,
+        maximum=MAX_TIMEOUT_SEC,
     )
     min_valid_default = _coerce_int(
         prompt_text("Min valid planner outputs", str(_workflow_setting(workflow_default, "min_valid_planners", 2))),
@@ -1487,6 +1572,69 @@ def load_agent_configs(task_spec: Dict[str, Any], config_path: Optional[Path] = 
     return planners, judge
 
 
+def _unique_fallback_models(config: AgentConfig) -> List[str]:
+    current = str(config.model or "").strip()
+    values: List[str] = []
+    for item in config.fallback_models:
+        value = str(item or "").strip()
+        if not value:
+            continue
+        if current and value == current:
+            continue
+        if value in values:
+            continue
+        values.append(value)
+    return values
+
+
+def _run_with_fallbacks(
+    config: AgentConfig,
+    prompt: str,
+    validator: Any,
+    deadline_monotonic: float,
+    *,
+    start_with_primary: bool = True,
+) -> Tuple[str, str, bool, Optional[str], Optional[str]]:
+    attempts: List[AgentConfig] = []
+    if start_with_primary:
+        attempts.append(config)
+    attempts.extend(replace(config, model=model) for model in _unique_fallback_models(config))
+    if not attempts:
+        return "", "", False, f"{config.name} failed", None
+    last_error: Optional[str] = None
+    last_raw = ""
+    last_text = ""
+    for candidate in attempts:
+        try:
+            running = spawn_cli_agent(candidate, prompt)
+            raw = collect_cli_output_until(running, deadline_monotonic)
+        except TimeoutError as exc:
+            last_error = str(exc)
+            last_raw = ""
+            last_text = ""
+            continue
+        except Exception as exc:
+            last_error = f"{candidate.name} failed to start: {exc}"
+            last_raw = ""
+            last_text = ""
+            continue
+
+        normalized = extract_agent_response(candidate, raw).strip()
+        valid, err = validator(normalized)
+        last_raw = raw
+        last_text = normalized
+        if valid:
+            used_model = candidate.model
+            if used_model == config.model:
+                used_model = None
+            return raw, normalized, True, None, used_model
+        model_label = candidate.model or "default model"
+        last_error = f"{candidate.name}: invalid output from {model_label}"
+        if err:
+            last_error = f"{last_error} ({err})"
+    return last_raw, last_text, False, last_error or f"{config.name} failed", None
+
+
 def run_planners(
     task_spec: Dict[str, Any],
     planners: List[AgentConfig],
@@ -1503,10 +1651,14 @@ def run_planners(
     remaining = planners[:]
     attempt = 0
     while remaining and attempt <= retry_limit:
-        running: List[RunningAgent] = []
-        for planner in remaining:
+        running_map: Dict[str, RunningAgent] = {}
+        prompt_map: Dict[str, str] = {}
+        current_batch = remaining[:]
+        attempt_deadline = time.monotonic() + max(float(timeout_sec), 0.1)
+        for planner in current_batch:
             prompt = render_planner_prompt(task_spec, plan_template, planner_prompt_template)
             prompt = f"{prompt}\n\nStyle constraint:\n- {prompt_hint}\n"
+            prompt_map[planner.name] = prompt
             timestamp = _ui_timestamp()
             _ui_upsert_planner(
                 ui_state,
@@ -1517,44 +1669,94 @@ def run_planners(
                 errors=[],
                 timestamp=timestamp,
             )
-            running.append(spawn_cli_agent(planner, prompt))
+            try:
+                running_map[planner.name] = spawn_cli_agent(planner, prompt)
+            except Exception as exc:
+                _ui_upsert_planner(
+                    ui_state,
+                    ui_instance,
+                    planner_id=planner.name,
+                    status="failed",
+                    summary="failed to launch",
+                    errors=[str(exc)],
+                    timestamp=_ui_timestamp(),
+                )
+                results.append(
+                    AgentResult(
+                        name=planner.name,
+                        raw_output="",
+                        data={"path": str(Path(run_dir) / f"plan-{planner.name}-attempt{attempt + 1}.md"), "text": ""},
+                        valid=False,
+                        error=f"{planner.name} failed to start: {exc}",
+                    )
+                )
 
         remaining = []
-        for entry in running:
+        for planner in current_batch:
+            if planner.name not in running_map:
+                if attempt < retry_limit:
+                    remaining.append(planner)
+                continue
+
+            entry = running_map[planner.name]
             try:
-                raw = collect_cli_output(entry, timeout_sec)
-                timeout_error = None
+                raw = collect_cli_output_until(entry, attempt_deadline)
+                normalized = extract_agent_response(entry.config, raw).strip()
+                valid, err = validate_markdown_plan(normalized)
+                plan_text = normalized
             except TimeoutError as exc:
                 raw = ""
-                timeout_error = str(exc)
-            normalized = extract_agent_response(entry.config, raw)
-            plan_text = normalized.strip()
-            if timeout_error is not None:
-                valid, err = False, timeout_error
-            else:
-                valid, err = validate_markdown_plan(plan_text)
-            plan_path = Path(run_dir) / f"plan-{entry.config.name}-attempt{attempt + 1}.md"
+                plan_text = ""
+                valid, err = False, str(exc)
+
+            selected_model: Optional[str] = None
+            if not valid:
+                fallback_raw, fallback_text, fallback_valid, fallback_err, fallback_model = _run_with_fallbacks(
+                    planner,
+                    prompt_map[planner.name],
+                    validate_markdown_plan,
+                    attempt_deadline,
+                    start_with_primary=False,
+                )
+                if fallback_valid:
+                    raw = fallback_raw
+                    plan_text = fallback_text
+                    valid = True
+                    err = None
+                    selected_model = fallback_model
+                else:
+                    if fallback_raw:
+                        raw = fallback_raw
+                    if fallback_text:
+                        plan_text = fallback_text
+                    if fallback_err:
+                        err = fallback_err
+
+            plan_path = Path(run_dir) / f"plan-{planner.name}-attempt{attempt + 1}.md"
             write_attempt = attempt > 0 or not valid
             if write_attempt:
                 plan_path.write_text(plan_text, encoding="utf-8")
             if valid:
-                final_path = Path(run_dir) / f"plan-{entry.config.name}.md"
+                final_path = Path(run_dir) / f"plan-{planner.name}.md"
                 final_path.write_text(plan_text, encoding="utf-8")
             timestamp = _ui_timestamp()
-            status = "complete" if valid else ("timed-out" if timeout_error else "needs-fix")
+            timed_out = bool(err and "timed out" in err)
+            status = "complete" if valid else ("timed-out" if timed_out else "needs-fix")
             errors = [err] if err else []
             summary = plan_text
+            if valid and selected_model:
+                summary = f"[fallback model: {selected_model}]\n\n{summary}"
             _ui_upsert_planner(
                 ui_state,
                 ui_instance,
-                planner_id=entry.config.name,
+                planner_id=planner.name,
                 status=status,
                 summary=summary or ("error" if errors else ""),
                 errors=errors,
                 timestamp=timestamp,
             )
             result = AgentResult(
-                name=entry.config.name,
+                name=planner.name,
                 raw_output=raw,
                 data={"path": str(plan_path if write_attempt else final_path), "text": plan_text},
                 valid=valid,
@@ -1566,13 +1768,13 @@ def run_planners(
                 _ui_upsert_planner(
                     ui_state,
                     ui_instance,
-                    planner_id=entry.config.name,
+                    planner_id=planner.name,
                     status="retrying",
                     summary="retry scheduled",
                     errors=[err] if err else [],
                     timestamp=retry_timestamp,
                 )
-                remaining.append(entry.config)
+                remaining.append(planner)
 
         attempt += 1
     return results
@@ -1601,25 +1803,22 @@ def run_judge(
         errors=[],
         timestamp=start_timestamp,
     )
-    running = spawn_cli_agent(judge, prompt)
-    try:
-        raw = collect_cli_output(running, timeout_sec)
-        timeout_error = None
-    except TimeoutError as exc:
-        raw = ""
-        timeout_error = str(exc)
-    normalized = extract_agent_response(judge, raw)
-    judge_text = normalized.strip()
+    deadline = time.monotonic() + max(float(timeout_sec), 0.1)
+    raw, judge_text, valid, err, selected_model = _run_with_fallbacks(
+        judge,
+        prompt,
+        validate_markdown_judge,
+        deadline,
+    )
     judge_path = Path(run_dir) / "judge.md"
     judge_path.write_text(judge_text, encoding="utf-8")
-    if timeout_error is not None:
-        valid, err = False, timeout_error
-    else:
-        valid, err = validate_markdown_judge(judge_text)
     finish_timestamp = _ui_timestamp()
-    status = "complete" if valid else ("failed" if timeout_error else "needs-fix")
+    timed_out = bool(err and "timed out" in err)
+    status = "complete" if valid else ("failed" if timed_out else "needs-fix")
     errors = [err] if err else []
     summary = judge_text
+    if valid and selected_model:
+        summary = f"[fallback model: {selected_model}]\n\n{summary}"
     _ui_update_judge(
         ui_state,
         ui_instance,
@@ -1686,7 +1885,12 @@ def _normalize_runtime_defaults(raw: Any) -> Dict[str, Any]:
         profile = fallback_profile if fallback_profile in PROFILE_SETTINGS else defaults["profile"]
     defaults["profile"] = profile
 
-    timeout_default = _coerce_int(raw.get("timeout_sec"), defaults["timeout_sec"], minimum=30, maximum=3600)
+    timeout_default = _coerce_int(
+        raw.get("timeout_sec"),
+        defaults["timeout_sec"],
+        minimum=MIN_TIMEOUT_SEC,
+        maximum=MAX_TIMEOUT_SEC,
+    )
     defaults["timeout_sec"] = timeout_default
 
     workflow_min = _coerce_int(_workflow_setting(workflow, "min_valid_planners", defaults["min_valid_planners"]), 2, minimum=1)
@@ -1809,6 +2013,19 @@ def _validate_agent_runtime(config: AgentConfig) -> Optional[str]:
     return None
 
 
+def collect_agent_runtime_errors(planners: List[AgentConfig], judge: AgentConfig) -> List[str]:
+    errors: List[str] = []
+    seen: Dict[str, AgentConfig] = {}
+    for cfg in planners + [judge]:
+        if cfg.name in seen:
+            continue
+        seen[cfg.name] = cfg
+        err = _validate_agent_runtime(cfg)
+        if err:
+            errors.append(err)
+    return errors
+
+
 def test_agents_config(config_path: Path) -> int:
     config_spec = load_agent_config_file(config_path)
     if not config_spec:
@@ -1821,15 +2038,7 @@ def test_agents_config(config_path: Path) -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
-    errors: List[str] = []
-    seen: Dict[str, AgentConfig] = {}
-    for cfg in planners + [judge]:
-        if cfg.name in seen:
-            continue
-        seen[cfg.name] = cfg
-        err = _validate_agent_runtime(cfg)
-        if err:
-            errors.append(err)
+    errors = collect_agent_runtime_errors(planners, judge)
 
     if errors:
         print("Agent check failed:", file=sys.stderr)
@@ -1902,6 +2111,7 @@ def main() -> int:
     ui = sub.add_parser("ui")
     ui.add_argument("--run-dir", required=True, help="Path to a run directory to resume")
     ui.add_argument("--no-open", action="store_true", help="Do not auto-open a browser window")
+    ui.add_argument("--config", required=False, help="Path to agents config JSON for UI actions")
 
     configure = sub.add_parser("configure")
     configure.add_argument("--config", required=False, help="Path to write agents config JSON")
@@ -1937,6 +2147,7 @@ def main() -> int:
         return 2
     if args.cmd == "ui":
         run_dir = Path(args.run_dir).expanduser().resolve()
+        ui_config_path = Path(args.config) if args.config else get_default_config_path()
         snapshot_path = run_dir / "ui-state.json"
         initial_state: Dict[str, Any] = _rebuild_ui_state_from_run(run_dir)
         ui_state = ui_server.UIState(initial_state, snapshot_path=snapshot_path)
@@ -1952,7 +2163,7 @@ def main() -> int:
                 run_dir,
                 {},
                 argparse.Namespace(timeout=DEFAULT_TIMEOUT_SEC),
-                get_default_config_path(),
+                ui_config_path,
                 action_stop,
                 keepalive,
                 None,
@@ -2005,19 +2216,18 @@ def main() -> int:
     ui_state: Optional[ui_server.UIState] = None
     ui_instance: Optional[ui_server.UIServer] = None
     keepalive = _KeepaliveController() if not args.no_ui else None
-    if not args.no_ui:
-        snapshot_path = run_dir / "ui-state.json"
-        ui_state = ui_server.UIState(snapshot_path=snapshot_path)
-        ui_instance = ui_server.start_server(state=ui_state)
-        ui_url = ui_instance.ui_url
-        webbrowser.open(ui_url)
-        print(f"UI server running at {ui_url}")
 
     try:
         planners, judge = load_agent_configs(task_spec, config_path=config_path)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+    runtime_errors = collect_agent_runtime_errors(planners, judge)
+    if runtime_errors:
+        print("Agent runtime preflight failed:", file=sys.stderr)
+        for item in runtime_errors:
+            print(f"- {item}", file=sys.stderr)
+        return 3
     workflow_explicit = args.workflow is not None
     workflow_name = args.workflow or str(runtime_defaults.get("workflow") or DEFAULT_RUNTIME_DEFAULTS["workflow"])
     if workflow_name not in WORKFLOW_SETTINGS:
@@ -2036,8 +2246,8 @@ def main() -> int:
     timeout_cap = _coerce_int(
         args.timeout if args.timeout is not None else runtime_defaults.get("timeout_sec"),
         DEFAULT_TIMEOUT_SEC,
-        minimum=30,
-        maximum=3600,
+        minimum=MIN_TIMEOUT_SEC,
+        maximum=MAX_TIMEOUT_SEC,
     )
     workflow_plan_only_default = bool(_workflow_setting(workflow_name, "plan_only", False))
     if workflow_explicit:
@@ -2093,6 +2303,14 @@ def main() -> int:
         "judge_timeout_sec": judge_timeout,
         "retry_limit": retry_limit,
     }
+
+    if not args.no_ui:
+        snapshot_path = run_dir / "ui-state.json"
+        ui_state = ui_server.UIState(snapshot_path=snapshot_path)
+        ui_instance = ui_server.start_server(state=ui_state)
+        ui_url = ui_instance.ui_url
+        webbrowser.open(ui_url)
+        print(f"UI server running at {ui_url}")
 
     if ui_state:
         timestamp = _ui_timestamp()
@@ -2168,38 +2386,8 @@ def main() -> int:
         if result.valid and result.data:
             latest_valid[result.name] = result.data
     valid_plans = list(latest_valid.values())
-    if len(valid_plans) < min_valid_required:
-        recommendations = []
-        planner_lookup = {planner.name: planner for planner in planners}
-        for result in planner_results:
-            planner_cfg = planner_lookup.get(result.name)
-            if planner_cfg:
-                rec = _recommendation_for_result(result, planner_cfg)
-                if rec:
-                    recommendations.append(rec)
-        if not recommendations:
-            recommendations.append(
-                f"Only {len(valid_plans)} valid planner outputs, need at least {min_valid_required}. "
-                "Try balanced/deep profile and verify agent configuration."
-            )
-        (run_dir / "recommendations.md").write_text("\n".join(f"- {item}" for item in recommendations), encoding="utf-8")
-        print("Insufficient valid planner outputs. See recommendations.md in run directory.", file=sys.stderr)
-        return 3
-
-    _ui_set_phase(ui_state, ui_instance, "judging", _ui_timestamp())
-    randomized_plans = []
-    for idx, plan in enumerate(valid_plans):
-        labeled = {"label": f"Plan {idx + 1}", "plan": anonymize_text(plan["text"])}
-        randomized_plans.append(labeled)
-    random.shuffle(randomized_plans)
-    alternatives_md = []
-    for item in randomized_plans:
-        alternatives_md.append(f"## {item['label']}\n\n{item['plan']}\n")
-    (run_dir / "alternatives.md").write_text("\n".join(alternatives_md), encoding="utf-8")
-    write_json(str(run_dir / "alternatives.json"), randomized_plans)
-
     metadata = {
-        "used_plans": [p["label"] for p in randomized_plans],
+        "used_plans": [],
         "profile": profile_name,
         "workflow": workflow_name,
         "timeouts": {"planner_sec": planner_timeout, "judge_sec": judge_timeout},
@@ -2216,6 +2404,66 @@ def main() -> int:
         },
         "warnings": [r.error for r in planner_results if r.error],
     }
+    if len(valid_plans) < min_valid_required:
+        recommendations = []
+        planner_lookup = {planner.name: planner for planner in planners}
+        for result in planner_results:
+            planner_cfg = planner_lookup.get(result.name)
+            if planner_cfg:
+                rec = _recommendation_for_result(result, planner_cfg)
+                if rec:
+                    recommendations.append(rec)
+        if not recommendations:
+            recommendations.append(
+                f"Only {len(valid_plans)} valid planner outputs, need at least {min_valid_required}. "
+                "Try balanced/deep profile and verify agent configuration."
+            )
+        (run_dir / "recommendations.md").write_text("\n".join(f"- {item}" for item in recommendations), encoding="utf-8")
+        metadata["validation"]["judge_valid"] = False
+        metadata["warnings"] = [r.error for r in planner_results if r.error]
+        partial_alternatives = [
+            {"label": f"Plan {idx + 1}", "plan": anonymize_text(plan.get("text", ""))}
+            for idx, plan in enumerate(valid_plans)
+        ]
+        failure_summary = {
+            "mode": "failed",
+            "reason": "insufficient_valid_plans",
+            "run_dir": str(run_dir),
+            "profile": profile_name,
+            "workflow": workflow_name,
+            "valid_planners": len(valid_plans),
+            "required_valid_planners": min_valid_required,
+        }
+        write_json(str(run_dir / "run-metadata.json"), metadata)
+        write_json(
+            str(run_dir / "run.json"),
+            {
+                "metadata": metadata,
+                "final_plan": "",
+                "alternatives": partial_alternatives,
+                "agent_checks": [],
+                "recommendations": recommendations,
+                "summary": failure_summary,
+            },
+        )
+        if ui_state:
+            _ui_set_phase(ui_state, ui_instance, "failed", _ui_timestamp())
+        print("Insufficient valid planner outputs. See recommendations.md in run directory.", file=sys.stderr)
+        return 3
+
+    _ui_set_phase(ui_state, ui_instance, "judging", _ui_timestamp())
+    randomized_plans = []
+    for idx, plan in enumerate(valid_plans):
+        labeled = {"label": f"Plan {idx + 1}", "plan": anonymize_text(plan["text"])}
+        randomized_plans.append(labeled)
+    random.shuffle(randomized_plans)
+    alternatives_md = []
+    for item in randomized_plans:
+        alternatives_md.append(f"## {item['label']}\n\n{item['plan']}\n")
+    (run_dir / "alternatives.md").write_text("\n".join(alternatives_md), encoding="utf-8")
+    write_json(str(run_dir / "alternatives.json"), randomized_plans)
+
+    metadata["used_plans"] = [p["label"] for p in randomized_plans]
 
     if plan_only_mode:
         _ui_set_phase(ui_state, ui_instance, "complete", _ui_timestamp())
@@ -2264,6 +2512,29 @@ def main() -> int:
             recommendations.append(judge_rec)
         recommendations.append("Judge output invalid. Try deep profile or assign a stronger judge model.")
         (run_dir / "recommendations.md").write_text("\n".join(f"- {item}" for item in recommendations), encoding="utf-8")
+        metadata["validation"]["judge_valid"] = False
+        metadata["warnings"] = [r.error for r in planner_results if r.error] + ([judge_result.error] if judge_result.error else [])
+        failure_summary = {
+            "mode": "failed",
+            "reason": "judge_invalid",
+            "run_dir": str(run_dir),
+            "profile": profile_name,
+            "workflow": workflow_name,
+        }
+        write_json(str(run_dir / "run-metadata.json"), metadata)
+        write_json(
+            str(run_dir / "run.json"),
+            {
+                "metadata": metadata,
+                "final_plan": "",
+                "alternatives": randomized_plans,
+                "agent_checks": [],
+                "recommendations": recommendations,
+                "summary": failure_summary,
+            },
+        )
+        if ui_state:
+            _ui_set_phase(ui_state, ui_instance, "failed", _ui_timestamp())
         print("Judge output invalid. See recommendations.md in run directory.", file=sys.stderr)
         return 4
     metadata["validation"]["judge_valid"] = judge_result.valid
@@ -2279,7 +2550,7 @@ def main() -> int:
         final_plan=final_text,
         judge_text=judge_text_full,
         alternatives=randomized_plans,
-        timeout_sec=max(60, judge_timeout // 2),
+        timeout_sec=max(MIN_TIMEOUT_SEC, judge_timeout // 2),
         run_dir=run_dir,
     )
     if agent_check_warnings:

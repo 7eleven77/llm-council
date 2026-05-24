@@ -394,7 +394,7 @@
 
     if (elements.runtimeTimeout && document.activeElement !== elements.runtimeTimeout) {
       const timeoutValue = Number.isFinite(Number(defaults.timeout_sec)) ? Number(defaults.timeout_sec) : 180;
-      elements.runtimeTimeout.value = String(Math.max(30, timeoutValue));
+      elements.runtimeTimeout.value = String(Math.max(5, timeoutValue));
     }
     if (elements.runtimeMinValid && document.activeElement !== elements.runtimeMinValid) {
       const minValid = Number.isFinite(Number(defaults.min_valid_planners)) ? Number(defaults.min_valid_planners) : 2;
@@ -689,7 +689,7 @@
         runtime_defaults: {
           workflow: elements.runtimeWorkflow?.value || 'full-council',
           profile: elements.runtimeProfile?.value || 'balanced',
-          timeout_sec: Number.isFinite(timeoutRaw) ? Math.max(30, timeoutRaw) : 180,
+          timeout_sec: Number.isFinite(timeoutRaw) ? Math.max(5, timeoutRaw) : 180,
           min_valid_planners: Number.isFinite(minValidRaw) ? Math.max(1, minValidRaw) : 2,
           plan_only: Boolean(elements.runtimePlanOnly?.checked)
         }

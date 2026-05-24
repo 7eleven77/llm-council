@@ -31,7 +31,21 @@
     lastUpdated: byId('lastUpdated'),
     sessionCountdown: byId('sessionCountdown'),
     keepOpenToggle: byId('keepOpenToggle'),
-    keepOpenStatus: byId('keepOpenStatus')
+    keepOpenStatus: byId('keepOpenStatus'),
+    refreshModelsBtn: byId('refreshModelsBtn'),
+    modelsStatus: byId('modelsStatus'),
+    agentListSelect: byId('agentListSelect'),
+    setJudgeBtn: byId('setJudgeBtn'),
+    toggleAgentBtn: byId('toggleAgentBtn'),
+    removeAgentBtn: byId('removeAgentBtn'),
+    agentListStatus: byId('agentListStatus'),
+    newAgentName: byId('newAgentName'),
+    newAgentKind: byId('newAgentKind'),
+    newAgentModel: byId('newAgentModel'),
+    addAgentBtn: byId('addAgentBtn'),
+    addAgentStatus: byId('addAgentStatus'),
+    modelCatalogText: byId('modelCatalogText'),
+    agentControlStatus: byId('agentControlStatus')
   };
 
   const token = new URLSearchParams(window.location.search).get('token');
@@ -57,6 +71,7 @@
   let sessionDeadline = null;
   let sessionKeepOpen = false;
   let sessionTimer = null;
+  let selectedConfigAgentName = '';
 
   const setText = (el, value, fallback = '—') => {
     if (!el) {
@@ -262,6 +277,57 @@
 
     updateLastUpdated(state.timestamps?.updated_at || new Date().toISOString());
     setSessionState(state);
+    updateAgentControls(state);
+  };
+
+  const updateAgentControls = (state) => {
+    const agents = Array.isArray(state?.config_agents) ? state.config_agents : [];
+    const judgeName = state?.config_judge || '';
+    if (elements.agentListSelect) {
+      elements.agentListSelect.textContent = '';
+      if (agents.length === 0) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No configured agents';
+        elements.agentListSelect.appendChild(option);
+      } else {
+        agents.forEach((agent) => {
+          const option = document.createElement('option');
+          option.value = agent.name || '';
+          const model = agent.model ? ` (${agent.model})` : '';
+          const enabledMark = agent.enabled ? '' : ' [disabled]';
+          const judgeMark = judgeName && judgeName === agent.name ? ' [judge]' : '';
+          option.textContent = `${agent.name || 'agent'}${model}${enabledMark}${judgeMark}`;
+          elements.agentListSelect.appendChild(option);
+        });
+      }
+      if (!selectedConfigAgentName || !agents.some((a) => a.name === selectedConfigAgentName)) {
+        selectedConfigAgentName = agents[0]?.name || '';
+      }
+      elements.agentListSelect.value = selectedConfigAgentName;
+    }
+
+    if (elements.modelCatalogText) {
+      const catalog = state?.model_catalog;
+      const items = Array.isArray(catalog?.items) ? catalog.items : [];
+      if (items.length === 0) {
+        elements.modelCatalogText.textContent = 'No model data yet. Click Refresh Models.';
+      } else {
+        const lines = [];
+        for (const item of items) {
+          const available = Array.isArray(item.available_models) ? item.available_models.join(', ') : '';
+          const source = item.source || 'fallback';
+          const warning = item.warning ? ` | warning: ${item.warning}` : '';
+          lines.push(`${item.agent}: ${available} | source: ${source}${warning}`);
+        }
+        elements.modelCatalogText.textContent = lines.join('\n');
+      }
+    }
+
+    if (elements.agentControlStatus) {
+      const count = agents.length;
+      elements.agentControlStatus.textContent = `${count} configured`;
+    }
   };
 
   const fetchState = async () => {
@@ -342,6 +408,14 @@
         setStatus(elements.refineStatus, status);
       } else if (action === 'keepalive') {
         setStatus(elements.keepOpenStatus, status);
+      } else if (action === 'models-refresh') {
+        setStatus(elements.modelsStatus, status);
+      } else if (action === 'agent-add') {
+        setStatus(elements.addAgentStatus, status);
+        fetchState();
+      } else if (action === 'agent-remove' || action === 'agent-toggle' || action === 'judge-set') {
+        setStatus(elements.agentListStatus, status);
+        fetchState();
       }
       updateLastUpdated(message.payload?.timestamp);
       return;
@@ -452,6 +526,76 @@
         { keep_open: elements.keepOpenToggle.checked },
         elements.keepOpenStatus
       );
+    });
+  }
+
+  if (elements.agentListSelect) {
+    elements.agentListSelect.addEventListener('change', () => {
+      selectedConfigAgentName = elements.agentListSelect.value;
+    });
+  }
+
+  if (elements.refreshModelsBtn) {
+    elements.refreshModelsBtn.addEventListener('click', () => {
+      postAction('/api/models-refresh', {}, elements.modelsStatus);
+    });
+  }
+
+  if (elements.addAgentBtn) {
+    elements.addAgentBtn.addEventListener('click', () => {
+      const name = (elements.newAgentName?.value || '').trim();
+      const kind = elements.newAgentKind?.value || 'custom';
+      const model = (elements.newAgentModel?.value || '').trim();
+      if (!name) {
+        setStatus(elements.addAgentStatus, 'name required');
+        return;
+      }
+      const payload = {
+        agent: {
+          name,
+          kind,
+          model,
+          auth_mode: 'login',
+          enabled: true
+        }
+      };
+      postAction('/api/agent-add', payload, elements.addAgentStatus);
+    });
+  }
+
+  if (elements.removeAgentBtn) {
+    elements.removeAgentBtn.addEventListener('click', () => {
+      const name = selectedConfigAgentName || elements.agentListSelect?.value || '';
+      if (!name) {
+        setStatus(elements.agentListStatus, 'select agent');
+        return;
+      }
+      postAction('/api/agent-remove', { name }, elements.agentListStatus);
+    });
+  }
+
+  if (elements.setJudgeBtn) {
+    elements.setJudgeBtn.addEventListener('click', () => {
+      const name = selectedConfigAgentName || elements.agentListSelect?.value || '';
+      if (!name) {
+        setStatus(elements.agentListStatus, 'select agent');
+        return;
+      }
+      postAction('/api/judge-set', { name }, elements.agentListStatus);
+    });
+  }
+
+  if (elements.toggleAgentBtn) {
+    elements.toggleAgentBtn.addEventListener('click', () => {
+      const name = selectedConfigAgentName || elements.agentListSelect?.value || '';
+      if (!name) {
+        setStatus(elements.agentListStatus, 'select agent');
+        return;
+      }
+      const agents = Array.isArray(currentState?.config_agents) ? currentState.config_agents : [];
+      const target = agents.find((agent) => agent.name === name);
+      const nextEnabled = !(target?.enabled ?? true);
+      postAction('/api/agent-toggle', { name, enabled: nextEnabled }, elements.agentListStatus);
     });
   }
 

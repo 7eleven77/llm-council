@@ -73,6 +73,7 @@ class AgentConfig:
     fallback_models: List[str] = field(default_factory=list)
     auth_mode: str = "login"
     api_env_var: Optional[str] = None
+    enabled: bool = True
 
 @dataclass
 class AgentResult:
@@ -663,6 +664,9 @@ def _rebuild_ui_state_from_run(run_dir: Path) -> Dict[str, Any]:
         },
         "final_plan": load_text(str(final_path)) if final_path.exists() else "",
         "errors": [],
+        "config_agents": [],
+        "config_judge": "",
+        "model_catalog": {"items": [], "updated_at": ""},
         "keep_open": False,
         "ui_deadline": _ui_deadline_from_now(DEFAULT_UI_SESSION_TTL_SEC),
         "timestamps": {"started_at": "", "updated_at": _ui_timestamp()},
@@ -692,6 +696,38 @@ def _handle_ui_actions(
     judge: Optional[AgentConfig] = None,
     plan_template: Optional[str] = None,
 ) -> None:
+    def sync_config_state() -> Dict[str, Any]:
+        config_data = _load_agents_config_runtime(config_path)
+        planners = config_data.get("planners") if isinstance(config_data.get("planners"), list) else []
+        agent_rows: List[Dict[str, Any]] = []
+        for item in planners:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            agent_rows.append(
+                {
+                    "name": name,
+                    "kind": str(item.get("kind") or "custom"),
+                    "model": str(item.get("model") or ""),
+                    "enabled": bool(item.get("enabled", True)),
+                }
+            )
+        judge_obj = config_data.get("judge") if isinstance(config_data.get("judge"), dict) else {}
+        judge_name = str(judge_obj.get("name") or "")
+        catalog = refresh_model_catalog(config_data)
+        if ui_state:
+            def mutator(state: Dict[str, Any]) -> None:
+                state["config_agents"] = agent_rows
+                state["config_judge"] = judge_name
+                state["model_catalog"] = catalog
+                _ui_update_timestamp(state, _ui_timestamp())
+            ui_state.mutate(mutator)
+        return config_data
+
+    sync_config_state()
+
     while not stop_event.is_set():
         try:
             action = ui_instance.actions.get(timeout=0.5)
@@ -803,6 +839,85 @@ def _handle_ui_actions(
                 status = "enabled" if keep_open else "disabled"
                 _ui_action_result(ui_instance, "keepalive", status, f"keep open {status}", None, _ui_timestamp())
                 continue
+            if path == "/api/models-refresh":
+                sync_config_state()
+                _ui_action_result(ui_instance, "models-refresh", "ok", "model catalog refreshed", None, _ui_timestamp())
+                continue
+            if path == "/api/agent-add":
+                config_data = _load_agents_config_runtime(config_path)
+                planners = config_data.get("planners") if isinstance(config_data.get("planners"), list) else []
+                agent = payload.get("agent")
+                if not isinstance(agent, dict):
+                    _ui_action_result(ui_instance, "agent-add", "failed", "missing agent payload", None, _ui_timestamp())
+                    continue
+                name = str(agent.get("name") or "").strip()
+                if not name:
+                    _ui_action_result(ui_instance, "agent-add", "failed", "agent name required", None, _ui_timestamp())
+                    continue
+                if any(isinstance(item, dict) and str(item.get("name") or "").strip() == name for item in planners):
+                    _ui_action_result(ui_instance, "agent-add", "failed", "agent already exists", None, _ui_timestamp())
+                    continue
+                planners.append(agent)
+                config_data["planners"] = planners
+                if not isinstance(config_data.get("judge"), dict) and planners:
+                    config_data["judge"] = planners[0]
+                _save_agents_config_runtime(config_path, config_data)
+                sync_config_state()
+                _ui_action_result(ui_instance, "agent-add", "ok", f"agent {name} added", None, _ui_timestamp())
+                continue
+            if path == "/api/agent-remove":
+                config_data = _load_agents_config_runtime(config_path)
+                planners = config_data.get("planners") if isinstance(config_data.get("planners"), list) else []
+                name = str(payload.get("name") or "").strip()
+                if not name:
+                    _ui_action_result(ui_instance, "agent-remove", "failed", "agent name required", None, _ui_timestamp())
+                    continue
+                new_planners = [item for item in planners if not (isinstance(item, dict) and str(item.get("name") or "").strip() == name)]
+                if len(new_planners) == len(planners):
+                    _ui_action_result(ui_instance, "agent-remove", "failed", "agent not found", None, _ui_timestamp())
+                    continue
+                config_data["planners"] = new_planners
+                judge = config_data.get("judge")
+                if isinstance(judge, dict) and str(judge.get("name") or "").strip() == name:
+                    config_data["judge"] = new_planners[0] if new_planners else None
+                _save_agents_config_runtime(config_path, config_data)
+                sync_config_state()
+                _ui_action_result(ui_instance, "agent-remove", "ok", f"agent {name} removed", None, _ui_timestamp())
+                continue
+            if path == "/api/agent-toggle":
+                config_data = _load_agents_config_runtime(config_path)
+                planners = config_data.get("planners") if isinstance(config_data.get("planners"), list) else []
+                name = str(payload.get("name") or "").strip()
+                enabled = bool(payload.get("enabled", True))
+                changed = False
+                for item in planners:
+                    if isinstance(item, dict) and str(item.get("name") or "").strip() == name:
+                        item["enabled"] = enabled
+                        changed = True
+                        break
+                if not changed:
+                    _ui_action_result(ui_instance, "agent-toggle", "failed", "agent not found", None, _ui_timestamp())
+                    continue
+                _save_agents_config_runtime(config_path, config_data)
+                sync_config_state()
+                _ui_action_result(ui_instance, "agent-toggle", "ok", f"agent {name} {'enabled' if enabled else 'disabled'}", None, _ui_timestamp())
+                continue
+            if path == "/api/judge-set":
+                config_data = _load_agents_config_runtime(config_path)
+                planners = config_data.get("planners") if isinstance(config_data.get("planners"), list) else []
+                name = str(payload.get("name") or "").strip()
+                target = next(
+                    (item for item in planners if isinstance(item, dict) and str(item.get("name") or "").strip() == name),
+                    None,
+                )
+                if not target:
+                    _ui_action_result(ui_instance, "judge-set", "failed", "agent not found", None, _ui_timestamp())
+                    continue
+                config_data["judge"] = dict(target)
+                _save_agents_config_runtime(config_path, config_data)
+                sync_config_state()
+                _ui_action_result(ui_instance, "judge-set", "ok", f"judge set to {name}", None, _ui_timestamp())
+                continue
             _ui_action_result(ui_instance, "unknown", "ignored", f"unhandled action: {path}", None, _ui_timestamp())
         except Exception as exc:
             _ui_action_result(ui_instance, "error", "failed", str(exc), None, _ui_timestamp())
@@ -882,6 +997,104 @@ def load_agent_config_file(path: Path) -> Optional[Dict[str, Any]]:
     if isinstance(data, dict) and ("planners" in data or "judge" in data):
         return data
     return None
+
+
+def _load_agents_config_runtime(config_path: Path) -> Dict[str, Any]:
+    data = load_agent_config_file(config_path)
+    if data:
+        planners = data.get("planners") or []
+        judge = data.get("judge")
+        if isinstance(planners, list):
+            return {"planners": planners, "judge": judge}
+    return {"planners": [], "judge": None}
+
+
+def _save_agents_config_runtime(config_path: Path, payload: Dict[str, Any]) -> None:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
+    write_json(str(tmp_path), payload)
+    os.replace(tmp_path, config_path)
+
+
+def _agent_names_from_config(config_data: Dict[str, Any]) -> List[str]:
+    planners = config_data.get("planners") or []
+    names: List[str] = []
+    for item in planners:
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+            if name:
+                names.append(name)
+    return names
+
+
+def _refresh_model_catalog_for_agent(agent: Dict[str, Any]) -> Dict[str, Any]:
+    name = str(agent.get("name") or "agent")
+    kind = str(agent.get("kind") or "custom").lower()
+    selected = str(agent.get("model") or "")
+    recommended = RECOMMENDED_MODELS.get(kind, [])
+    source = "fallback"
+    available: List[str] = []
+    warning = ""
+
+    if kind == "opencode" and shutil.which("opencode"):
+        try:
+            completed = subprocess.run(
+                ["opencode", "models"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            lines = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+            # Most outputs include provider/model tokens; keep simple extraction.
+            candidates: List[str] = []
+            for line in lines:
+                for token in line.split():
+                    if "/" in token and not token.startswith("http"):
+                        candidates.append(token.strip("`,"))
+            if candidates:
+                available = sorted(set(candidates))
+                source = "live"
+        except Exception:
+            warning = "live model lookup failed"
+
+    if not available:
+        available = list(recommended)
+    if not available and selected:
+        available = [selected]
+    if not warning and selected and available and selected not in available:
+        warning = "selected model not in discovered list"
+
+    return {
+        "agent": name,
+        "kind": kind,
+        "selected_model": selected,
+        "available_models": available,
+        "recommended_models": recommended,
+        "source": source,
+        "warning": warning,
+        "timestamp": _ui_timestamp(),
+    }
+
+
+def refresh_model_catalog(config_data: Dict[str, Any]) -> Dict[str, Any]:
+    planners = config_data.get("planners") or []
+    judge = config_data.get("judge")
+    entries: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for agent in planners:
+        if not isinstance(agent, dict):
+            continue
+        name = str(agent.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        entries.append(_refresh_model_catalog_for_agent(agent))
+    if isinstance(judge, dict):
+        name = str(judge.get("name") or "").strip()
+        if name and name not in seen:
+            entries.append(_refresh_model_catalog_for_agent(judge))
+    return {"items": entries, "updated_at": _ui_timestamp()}
 
 
 def configure_agents(config_path: Path) -> None:
@@ -1063,6 +1276,7 @@ def _normalize_agent_spec(spec: Any, fallback_name: str) -> AgentConfig:
     api_env_var = data.get("api_env_var")
     if api_env_var is not None:
         api_env_var = str(api_env_var).strip() or None
+    enabled = bool(data.get("enabled", True))
     if kind == "opencode" and not cli_format:
         cli_format = "json"
     return AgentConfig(
@@ -1080,6 +1294,7 @@ def _normalize_agent_spec(spec: Any, fallback_name: str) -> AgentConfig:
         fallback_models=fallback_models,
         auth_mode=auth_mode,
         api_env_var=api_env_var,
+        enabled=enabled,
     )
 
 
@@ -1113,6 +1328,8 @@ def load_agent_configs(task_spec: Dict[str, Any], config_path: Optional[Path] = 
     seen = set()
     for idx, spec in enumerate(planner_specs, start=1):
         agent = _normalize_agent_spec(spec, f"planner-{idx}")
+        if not agent.enabled:
+            continue
         if agent.name in seen:
             agent.name = f"{agent.name}-{idx}"
         seen.add(agent.name)
@@ -1140,6 +1357,7 @@ def load_agent_configs(task_spec: Dict[str, Any], config_path: Optional[Path] = 
             fallback_models=list(primary.fallback_models),
             auth_mode=primary.auth_mode,
             api_env_var=primary.api_env_var,
+            enabled=primary.enabled,
         )
 
     return planners, judge
@@ -1432,6 +1650,11 @@ def main() -> int:
     agents_test = agents_sub.add_parser("test")
     agents_test.add_argument("--config", required=False, help="Path to agents config JSON")
 
+    models = sub.add_parser("models")
+    models_sub = models.add_subparsers(dest="models_cmd", required=True)
+    models_refresh = models_sub.add_parser("refresh")
+    models_refresh.add_argument("--config", required=False, help="Path to agents config JSON")
+
     args = parser.parse_args()
 
     if args.cmd == "configure":
@@ -1442,6 +1665,14 @@ def main() -> int:
         if args.agents_cmd == "test":
             config_path = Path(args.config) if args.config else get_default_config_path()
             return test_agents_config(config_path)
+        return 2
+    if args.cmd == "models":
+        if args.models_cmd == "refresh":
+            config_path = Path(args.config) if args.config else get_default_config_path()
+            config_data = _load_agents_config_runtime(config_path)
+            catalog = refresh_model_catalog(config_data)
+            print(json.dumps(catalog, indent=2, sort_keys=True))
+            return 0
         return 2
     if args.cmd == "ui":
         run_dir = Path(args.run_dir).expanduser().resolve()
@@ -1554,6 +1785,17 @@ def main() -> int:
             "judge": {"status": "pending", "summary": "", "errors": []},
             "final_plan": "",
             "errors": [],
+            "config_agents": [
+                {
+                    "name": planner.name,
+                    "kind": planner.kind,
+                    "model": planner.model or "",
+                    "enabled": planner.enabled,
+                }
+                for planner in planners
+            ],
+            "config_judge": judge.name,
+            "model_catalog": {"items": [], "updated_at": ""},
             "keep_open": False,
             "ui_deadline": _ui_deadline_from_now(DEFAULT_UI_SESSION_TTL_SEC),
             "timestamps": {"started_at": timestamp, "updated_at": timestamp},

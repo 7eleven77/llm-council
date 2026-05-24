@@ -361,6 +361,26 @@ textarea#refineContext {
   min-height: 44px;
 }
 
+.rerun-row input[type='text'] {
+  min-height: 44px;
+  min-width: 170px;
+  padding: 0.55rem 0.7rem;
+  border: 3px solid var(--ink);
+  background: #fff;
+  font-family: var(--body);
+}
+
+.action-group .planner-select {
+  min-width: 180px;
+}
+
+#modelCatalogText {
+  min-height: 130px;
+  max-height: 260px;
+  overflow: auto;
+  background: #f8f8f8;
+}
+
 .status-text {
   font-size: 0.9rem;
 }
@@ -449,6 +469,51 @@ textarea#refineContext {
           <div class="panel-body panel-body--judge">
             <pre id="judgeSummary" class="content-block">—</pre>
             <ul id="judgeErrors" class="error-list"></ul>
+          </div>
+        </section>
+
+        <section class="panel panel-wide">
+          <div class="panel-header">
+            <h2>Agent Control</h2>
+            <span id="agentControlStatus" class="panel-sub">ready</span>
+          </div>
+          <div class="panel-body">
+            <div class="action-row">
+              <div class="action-group action-group--actions">
+                <button id="refreshModelsBtn" class="btn primary" type="button">Refresh Models</button>
+                <span id="modelsStatus" class="status-text"></span>
+              </div>
+              <div class="action-group">
+                <label class="label-spaced" for="agentListSelect">Configured Agent</label>
+                <div class="rerun-row">
+                  <select id="agentListSelect" class="planner-select"></select>
+                  <button id="setJudgeBtn" class="btn primary" type="button">Set Judge</button>
+                  <button id="toggleAgentBtn" class="btn danger" type="button">Enable/Disable</button>
+                  <button id="removeAgentBtn" class="btn danger" type="button">Remove</button>
+                </div>
+                <span id="agentListStatus" class="status-text"></span>
+              </div>
+              <div class="action-group">
+                <label class="label-spaced">Add Agent</label>
+                <div class="rerun-row">
+                  <input id="newAgentName" type="text" placeholder="name">
+                  <select id="newAgentKind" class="planner-select">
+                    <option value="codex">codex</option>
+                    <option value="claude">claude</option>
+                    <option value="gemini">gemini</option>
+                    <option value="opencode">opencode</option>
+                    <option value="custom">custom</option>
+                  </select>
+                  <input id="newAgentModel" type="text" placeholder="model (optional)">
+                  <button id="addAgentBtn" class="btn primary" type="button">Add Agent</button>
+                </div>
+                <span id="addAgentStatus" class="status-text"></span>
+              </div>
+              <div class="action-group">
+                <label class="label-spaced">Model Catalog</label>
+                <pre id="modelCatalogText" class="content-block">—</pre>
+              </div>
+            </div>
           </div>
         </section>
 

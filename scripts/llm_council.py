@@ -76,6 +76,15 @@ RECOMMENDED_MODELS: Dict[str, List[str]] = {
     "gemini": ["gemini-3-pro-preview", "gemini-2.5-pro"],
     "opencode": ["openai/gpt-5.2-codex", "anthropic/claude-sonnet-4-5"],
 }
+WORKFLOW_CHOICES: Tuple[str, ...] = tuple(WORKFLOW_SETTINGS.keys())
+PROFILE_CHOICES: Tuple[str, ...] = tuple(PROFILE_SETTINGS.keys())
+DEFAULT_RUNTIME_DEFAULTS: Dict[str, Any] = {
+    "workflow": "full-council",
+    "profile": "balanced",
+    "timeout_sec": DEFAULT_TIMEOUT_SEC,
+    "min_valid_planners": 2,
+    "plan_only": False,
+}
 
 @dataclass
 class AgentConfig:
@@ -687,6 +696,9 @@ def _rebuild_ui_state_from_run(run_dir: Path) -> Dict[str, Any]:
         "config_agents": [],
         "config_judge": "",
         "model_catalog": {"items": [], "updated_at": ""},
+        "runtime_defaults": dict(DEFAULT_RUNTIME_DEFAULTS),
+        "runtime_options": _runtime_defaults_options(),
+        "run_settings": {},
         "keep_open": False,
         "ui_deadline": _ui_deadline_from_now(DEFAULT_UI_SESSION_TTL_SEC),
         "timestamps": {"started_at": "", "updated_at": _ui_timestamp()},
@@ -719,6 +731,27 @@ def _handle_ui_actions(
     def sync_config_state() -> Dict[str, Any]:
         config_data = _load_agents_config_runtime(config_path)
         planners = config_data.get("planners") if isinstance(config_data.get("planners"), list) else []
+        if not planners and ui_state:
+            snapshot_agents = ui_state.get().get("config_agents")
+            if isinstance(snapshot_agents, list):
+                planners = []
+                for item in snapshot_agents:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name") or "").strip()
+                    if not name:
+                        continue
+                    planners.append(
+                        {
+                            "name": name,
+                            "kind": str(item.get("kind") or "custom"),
+                            "model": str(item.get("model") or ""),
+                            "enabled": bool(item.get("enabled", True)),
+                        }
+                    )
+                config_data["planners"] = planners
+        runtime_defaults = _runtime_defaults_from_config(config_data)
+        config_data["runtime_defaults"] = runtime_defaults
         agent_rows: List[Dict[str, Any]] = []
         for item in planners:
             if not isinstance(item, dict):
@@ -742,6 +775,8 @@ def _handle_ui_actions(
                 state["config_agents"] = agent_rows
                 state["config_judge"] = judge_name
                 state["model_catalog"] = catalog
+                state["runtime_defaults"] = runtime_defaults
+                state["runtime_options"] = _runtime_defaults_options()
                 _ui_update_timestamp(state, _ui_timestamp())
             ui_state.mutate(mutator)
         return config_data
@@ -809,7 +844,8 @@ def _handle_ui_actions(
                 prompt = _build_refine_prompt(plan_template, task_brief, final_plan, context)
                 running = spawn_cli_agent(judge, prompt)
                 try:
-                    raw = collect_cli_output(running, args.timeout)
+                    refine_timeout = _coerce_int(getattr(args, "timeout", DEFAULT_TIMEOUT_SEC), DEFAULT_TIMEOUT_SEC, minimum=30, maximum=3600)
+                    raw = collect_cli_output(running, refine_timeout)
                 except TimeoutError as exc:
                     _ui_update_judge(
                         ui_state,
@@ -862,6 +898,41 @@ def _handle_ui_actions(
             if path == "/api/models-refresh":
                 sync_config_state()
                 _ui_action_result(ui_instance, "models-refresh", "ok", "model catalog refreshed", None, _ui_timestamp())
+                continue
+            if path == "/api/runtime-defaults":
+                config_data = _load_agents_config_runtime(config_path)
+                current = _runtime_defaults_from_config(config_data)
+                update = payload.get("runtime_defaults")
+                if isinstance(update, dict):
+                    merged = dict(current)
+                    merged.update(update)
+                elif isinstance(payload, dict):
+                    merged = dict(current)
+                    merged.update(payload)
+                else:
+                    _ui_action_result(ui_instance, "runtime-defaults", "failed", "invalid defaults payload", None, _ui_timestamp())
+                    continue
+                normalized = _normalize_runtime_defaults(merged)
+                planners = config_data.get("planners") if isinstance(config_data.get("planners"), list) else []
+                enabled_planners = [
+                    item
+                    for item in planners
+                    if isinstance(item, dict) and bool(item.get("enabled", True))
+                ]
+                max_valid = len(enabled_planners)
+                clipped = False
+                if max_valid > 0 and normalized["min_valid_planners"] > max_valid:
+                    normalized["min_valid_planners"] = max_valid
+                    clipped = True
+                config_data["runtime_defaults"] = normalized
+                _save_agents_config_runtime(config_path, config_data)
+                sync_config_state()
+                clip_note = " (min-valid adjusted to enabled planner count)" if clipped else ""
+                message = (
+                    f"defaults saved: {normalized['workflow']} / {normalized['profile']}, "
+                    f"timeout {normalized['timeout_sec']}s{clip_note}"
+                )
+                _ui_action_result(ui_instance, "runtime-defaults", "ok", message, None, _ui_timestamp())
                 continue
             if path == "/api/agent-add":
                 config_data = _load_agents_config_runtime(config_path)
@@ -1025,12 +1096,15 @@ def _load_agents_config_runtime(config_path: Path) -> Dict[str, Any]:
         planners = data.get("planners") or []
         judge = data.get("judge")
         if isinstance(planners, list):
-            return {"planners": planners, "judge": judge}
-    return {"planners": [], "judge": None}
+            runtime_defaults = _runtime_defaults_from_config(data)
+            return {"planners": planners, "judge": judge, "runtime_defaults": runtime_defaults}
+    return {"planners": [], "judge": None, "runtime_defaults": dict(DEFAULT_RUNTIME_DEFAULTS)}
 
 
 def _save_agents_config_runtime(config_path: Path, payload: Dict[str, Any]) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(payload, dict):
+        payload["runtime_defaults"] = _runtime_defaults_from_config(payload)
     tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
     write_json(str(tmp_path), payload)
     os.replace(tmp_path, config_path)
@@ -1233,7 +1307,37 @@ def configure_agents(config_path: Path) -> None:
         judge_idx = prompt_choice("Select judge", planners, default_idx=1)
         judge = planners[judge_idx - 1]
 
-    payload = {"planners": planners, "judge": judge}
+    print("\nDefault run settings")
+    workflow_default = prompt_text("Workflow (quick-decide|full-council|risk-review)", "full-council").strip()
+    if workflow_default not in WORKFLOW_SETTINGS:
+        workflow_default = "full-council"
+    profile_default = prompt_text("Profile (fast|balanced|deep)", str(_workflow_setting(workflow_default, "profile", "balanced"))).strip()
+    if profile_default not in PROFILE_SETTINGS:
+        profile_default = str(_workflow_setting(workflow_default, "profile", "balanced"))
+    timeout_default = _coerce_int(
+        prompt_text("Max timeout seconds", str(DEFAULT_TIMEOUT_SEC)),
+        DEFAULT_TIMEOUT_SEC,
+        minimum=30,
+        maximum=3600,
+    )
+    min_valid_default = _coerce_int(
+        prompt_text("Min valid planner outputs", str(_workflow_setting(workflow_default, "min_valid_planners", 2))),
+        int(_workflow_setting(workflow_default, "min_valid_planners", 2)),
+        minimum=1,
+        maximum=16,
+    )
+    plan_only_default = prompt_yes_no("Default to plan-only mode?", default_yes=bool(_workflow_setting(workflow_default, "plan_only", False)))
+    runtime_defaults = _normalize_runtime_defaults(
+        {
+            "workflow": workflow_default,
+            "profile": profile_default,
+            "timeout_sec": timeout_default,
+            "min_valid_planners": min_valid_default,
+            "plan_only": plan_only_default,
+        }
+    )
+
+    payload = {"planners": planners, "judge": judge, "runtime_defaults": runtime_defaults}
     config_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
     print(f"\nSaving config to {config_path}.")
@@ -1554,6 +1658,56 @@ def _workflow_setting(workflow: str, key: str, fallback: Any) -> Any:
     return values.get(key, fallback)
 
 
+def _coerce_int(value: Any, fallback: int, *, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        result = fallback
+    if minimum is not None:
+        result = max(minimum, result)
+    if maximum is not None:
+        result = min(maximum, result)
+    return result
+
+
+def _normalize_runtime_defaults(raw: Any) -> Dict[str, Any]:
+    defaults = dict(DEFAULT_RUNTIME_DEFAULTS)
+    if not isinstance(raw, dict):
+        return defaults
+
+    workflow = str(raw.get("workflow") or defaults["workflow"]).strip()
+    if workflow not in WORKFLOW_SETTINGS:
+        workflow = defaults["workflow"]
+    defaults["workflow"] = workflow
+
+    fallback_profile = str(_workflow_setting(workflow, "profile", defaults["profile"]))
+    profile = str(raw.get("profile") or fallback_profile).strip()
+    if profile not in PROFILE_SETTINGS:
+        profile = fallback_profile if fallback_profile in PROFILE_SETTINGS else defaults["profile"]
+    defaults["profile"] = profile
+
+    timeout_default = _coerce_int(raw.get("timeout_sec"), defaults["timeout_sec"], minimum=30, maximum=3600)
+    defaults["timeout_sec"] = timeout_default
+
+    workflow_min = _coerce_int(_workflow_setting(workflow, "min_valid_planners", defaults["min_valid_planners"]), 2, minimum=1)
+    min_valid = _coerce_int(raw.get("min_valid_planners"), workflow_min, minimum=1, maximum=16)
+    defaults["min_valid_planners"] = min_valid
+
+    plan_only = bool(raw.get("plan_only", defaults["plan_only"]))
+    defaults["plan_only"] = plan_only
+    return defaults
+
+
+def _runtime_defaults_from_config(config_data: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(config_data, dict):
+        return dict(DEFAULT_RUNTIME_DEFAULTS)
+    return _normalize_runtime_defaults(config_data.get("runtime_defaults"))
+
+
+def _runtime_defaults_options() -> Dict[str, List[str]]:
+    return {"workflows": list(WORKFLOW_CHOICES), "profiles": list(PROFILE_CHOICES)}
+
+
 def _recommendation_for_result(result: AgentResult, config: AgentConfig) -> Optional[str]:
     if not result.error:
         return None
@@ -1700,18 +1854,23 @@ def main() -> int:
     run = sub.add_parser("run")
     run.add_argument("--spec", required=True, help="Path to task spec JSON")
     run.add_argument("--out", required=False, help="Path to write final plan Markdown")
-    run.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SEC)
+    run.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help="Global timeout cap in seconds. Defaults to configured runtime defaults.",
+    )
     run.add_argument("--seed", type=int, default=None)
     run.add_argument("--config", required=False, help="Path to agents config JSON")
     run.add_argument(
         "--workflow",
-        choices=["quick-decide", "full-council", "risk-review"],
-        default="full-council",
+        choices=list(WORKFLOW_CHOICES),
+        default=None,
         help="Workflow template controlling defaults for profile and planning mode",
     )
     run.add_argument(
         "--profile",
-        choices=["fast", "balanced", "deep"],
+        choices=list(PROFILE_CHOICES),
         default=None,
         help="Execution profile for timeouts, retries, and prompt depth",
     )
@@ -1825,6 +1984,8 @@ def main() -> int:
         )
         return 2
     config_path = Path(args.config) if args.config else get_default_config_path()
+    runtime_config = _load_agents_config_runtime(config_path)
+    runtime_defaults = _runtime_defaults_from_config(runtime_config)
     prompt_text = load_text(resolve_path("../references/prompts.md"))
     planner_prompt = prompt_text.split("## Judge Prompt")[0].split("```text", 1)[1].rsplit("```", 1)[0]
     judge_prompt = prompt_text.split("## Judge Prompt", 1)[1].split("```text", 1)[1].rsplit("```", 1)[0]
@@ -1857,16 +2018,54 @@ def main() -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    workflow_name = args.workflow
-    profile_name = args.profile or str(_workflow_setting(workflow_name, "profile", "balanced"))
+    workflow_explicit = args.workflow is not None
+    workflow_name = args.workflow or str(runtime_defaults.get("workflow") or DEFAULT_RUNTIME_DEFAULTS["workflow"])
+    if workflow_name not in WORKFLOW_SETTINGS:
+        workflow_name = str(DEFAULT_RUNTIME_DEFAULTS["workflow"])
+    workflow_profile_default = str(_workflow_setting(workflow_name, "profile", "balanced"))
+    if args.profile:
+        profile_name = args.profile
+    elif workflow_explicit:
+        profile_name = workflow_profile_default
+    else:
+        profile_name = str(runtime_defaults.get("profile") or workflow_profile_default)
     if profile_name not in PROFILE_SETTINGS:
         print(f"Unknown profile: {profile_name}", file=sys.stderr)
         return 2
-    plan_only_mode = args.plan_only
-    if not args.plan_only and not args.full_run and bool(_workflow_setting(workflow_name, "plan_only", False)):
+
+    timeout_cap = _coerce_int(
+        args.timeout if args.timeout is not None else runtime_defaults.get("timeout_sec"),
+        DEFAULT_TIMEOUT_SEC,
+        minimum=30,
+        maximum=3600,
+    )
+    workflow_plan_only_default = bool(_workflow_setting(workflow_name, "plan_only", False))
+    if workflow_explicit:
+        plan_only_default = workflow_plan_only_default
+    else:
+        plan_only_default = bool(runtime_defaults.get("plan_only", workflow_plan_only_default))
+    if args.full_run:
+        plan_only_mode = False
+    elif args.plan_only:
         plan_only_mode = True
-    min_valid_default = int(_workflow_setting(workflow_name, "min_valid_planners", 2))
-    min_valid_required = max(1, int(args.min_valid_planners if args.min_valid_planners is not None else min_valid_default))
+    else:
+        plan_only_mode = plan_only_default
+
+    workflow_min_valid_default = int(_workflow_setting(workflow_name, "min_valid_planners", 2))
+    min_valid_default = _coerce_int(
+        runtime_defaults.get("min_valid_planners"),
+        workflow_min_valid_default,
+        minimum=1,
+        maximum=16,
+    )
+    if workflow_explicit:
+        min_valid_default = workflow_min_valid_default
+    min_valid_required = _coerce_int(
+        args.min_valid_planners if args.min_valid_planners is not None else min_valid_default,
+        min_valid_default,
+        minimum=1,
+        maximum=16,
+    )
     if min_valid_required > len(planners):
         print(
             f"min-valid-planners ({min_valid_required}) cannot exceed planner count ({len(planners)}).",
@@ -1877,13 +2076,23 @@ def main() -> int:
     if args.seed is not None:
         random.seed(args.seed)
 
-    planner_timeout = int(min(args.timeout, _profile_setting(profile_name, "planner_timeout", DEFAULT_TIMEOUT_SEC)))
-    judge_timeout = int(min(args.timeout, _profile_setting(profile_name, "judge_timeout", DEFAULT_TIMEOUT_SEC)))
+    planner_timeout = int(min(timeout_cap, _profile_setting(profile_name, "planner_timeout", DEFAULT_TIMEOUT_SEC)))
+    judge_timeout = int(min(timeout_cap, _profile_setting(profile_name, "judge_timeout", DEFAULT_TIMEOUT_SEC)))
     retry_limit = int(_profile_setting(profile_name, "retry_limit", RETRY_LIMIT))
     prompt_hint = str(_profile_setting(profile_name, "planner_hint", "Keep the plan concise but complete."))
     workflow_hint = str(_workflow_setting(workflow_name, "workflow_hint", ""))
     if workflow_hint:
         prompt_hint = f"{prompt_hint} {workflow_hint}".strip()
+    run_settings = {
+        "workflow": workflow_name,
+        "profile": profile_name,
+        "plan_only": plan_only_mode,
+        "timeout_sec": timeout_cap,
+        "min_valid_planners": min_valid_required,
+        "planner_timeout_sec": planner_timeout,
+        "judge_timeout_sec": judge_timeout,
+        "retry_limit": retry_limit,
+    }
 
     if ui_state:
         timestamp = _ui_timestamp()
@@ -1909,6 +2118,9 @@ def main() -> int:
             ],
             "config_judge": judge.name,
             "model_catalog": {"items": [], "updated_at": ""},
+            "runtime_defaults": runtime_defaults,
+            "runtime_options": _runtime_defaults_options(),
+            "run_settings": run_settings,
             "keep_open": False,
             "ui_deadline": _ui_deadline_from_now(DEFAULT_UI_SESSION_TTL_SEC),
             "timestamps": {"started_at": timestamp, "updated_at": timestamp},

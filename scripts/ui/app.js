@@ -4,6 +4,8 @@
   const elements = {
     runId: byId('runId'),
     phase: byId('phase'),
+    runSettingsSummary: byId('runSettingsSummary'),
+    agentPulseStrip: byId('agentPulseStrip'),
     taskBrief: byId('taskBrief'),
     plannerSummary: byId('plannerSummary'),
     plannerSelect: byId('plannerSelect'),
@@ -45,7 +47,14 @@
     addAgentBtn: byId('addAgentBtn'),
     addAgentStatus: byId('addAgentStatus'),
     modelCatalogText: byId('modelCatalogText'),
-    agentControlStatus: byId('agentControlStatus')
+    agentControlStatus: byId('agentControlStatus'),
+    runtimeWorkflow: byId('runtimeWorkflow'),
+    runtimeProfile: byId('runtimeProfile'),
+    runtimeTimeout: byId('runtimeTimeout'),
+    runtimeMinValid: byId('runtimeMinValid'),
+    runtimePlanOnly: byId('runtimePlanOnly'),
+    saveRuntimeDefaultsBtn: byId('saveRuntimeDefaultsBtn'),
+    runtimeDefaultsStatus: byId('runtimeDefaultsStatus')
   };
 
   const token = new URLSearchParams(window.location.search).get('token');
@@ -60,6 +69,9 @@
     judge: { status: '', summary: '', errors: [] },
     final_plan: '',
     errors: [],
+    runtime_defaults: {},
+    runtime_options: { workflows: [], profiles: [] },
+    run_settings: {},
     timestamps: {}
   };
 
@@ -91,6 +103,48 @@
     } else {
       delete el.dataset.tone;
     }
+  };
+
+  const statusToneClass = (status) => {
+    const value = String(status || '').toLowerCase();
+    if (value === 'running' || value === 'retrying') {
+      return 'thinking';
+    }
+    if (value === 'complete' || value === 'ok' || value === 'accepted' || value === 'saved') {
+      return 'done';
+    }
+    if (value.includes('fail') || value.includes('error') || value.includes('timed')) {
+      return 'error';
+    }
+    if (value.includes('fix')) {
+      return 'warn';
+    }
+    return 'idle';
+  };
+
+  const syncSelectOptions = (selectEl, options, currentValue, fallbackValue) => {
+    if (!selectEl) {
+      return '';
+    }
+    const list = Array.isArray(options) ? options : [];
+    const existing = new Set(Array.from(selectEl.options).map((option) => option.value));
+    for (const value of list) {
+      if (existing.has(value)) {
+        continue;
+      }
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = value;
+      selectEl.appendChild(option);
+      existing.add(value);
+    }
+    const next =
+      (currentValue && existing.has(currentValue) && currentValue) ||
+      (fallbackValue && existing.has(fallbackValue) && fallbackValue) ||
+      list[0] ||
+      '';
+    selectEl.value = next;
+    return next;
   };
 
   const attemptCloseUi = () => {
@@ -278,6 +332,8 @@
     updateLastUpdated(state.timestamps?.updated_at || new Date().toISOString());
     setSessionState(state);
     updateAgentControls(state);
+    updateRuntimeControls(state);
+    updateAgentPulse(state);
   };
 
   const updateAgentControls = (state) => {
@@ -327,6 +383,87 @@
     if (elements.agentControlStatus) {
       const count = agents.length;
       elements.agentControlStatus.textContent = `${count} configured`;
+    }
+  };
+
+  const updateRuntimeControls = (state) => {
+    const defaults = state?.runtime_defaults && typeof state.runtime_defaults === 'object' ? state.runtime_defaults : {};
+    const options = state?.runtime_options && typeof state.runtime_options === 'object' ? state.runtime_options : {};
+    syncSelectOptions(elements.runtimeWorkflow, options.workflows, defaults.workflow, 'full-council');
+    syncSelectOptions(elements.runtimeProfile, options.profiles, defaults.profile, 'balanced');
+
+    if (elements.runtimeTimeout && document.activeElement !== elements.runtimeTimeout) {
+      const timeoutValue = Number.isFinite(Number(defaults.timeout_sec)) ? Number(defaults.timeout_sec) : 180;
+      elements.runtimeTimeout.value = String(Math.max(30, timeoutValue));
+    }
+    if (elements.runtimeMinValid && document.activeElement !== elements.runtimeMinValid) {
+      const minValid = Number.isFinite(Number(defaults.min_valid_planners)) ? Number(defaults.min_valid_planners) : 2;
+      elements.runtimeMinValid.value = String(Math.max(1, minValid));
+    }
+    if (elements.runtimePlanOnly) {
+      elements.runtimePlanOnly.checked = Boolean(defaults.plan_only);
+    }
+
+    if (elements.runSettingsSummary) {
+      const runSettings = state?.run_settings && typeof state.run_settings === 'object' ? state.run_settings : {};
+      if (!runSettings.workflow) {
+        elements.runSettingsSummary.textContent = 'active run: waiting for settings';
+      } else {
+        const modeText = runSettings.plan_only ? 'plan-only' : 'full run';
+        elements.runSettingsSummary.textContent =
+          `active run: ${runSettings.workflow} • ${runSettings.profile} • ${modeText} • timeout ${runSettings.timeout_sec}s`;
+      }
+    }
+  };
+
+  const updateAgentPulse = (state) => {
+    if (!elements.agentPulseStrip) {
+      return;
+    }
+    const agents = Array.isArray(state?.config_agents) ? state.config_agents : [];
+    const planners = Array.isArray(state?.planners) ? state.planners : [];
+    const plannerStatusByName = new Map();
+    for (const planner of planners) {
+      const key = planner?.id || '';
+      if (key) {
+        plannerStatusByName.set(key, planner?.status || 'idle');
+      }
+    }
+    const judgeName = state?.config_judge || '';
+    const judgeStatus = state?.judge?.status || 'idle';
+
+    elements.agentPulseStrip.textContent = '';
+    if (agents.length === 0) {
+      const placeholder = document.createElement('span');
+      placeholder.className = 'agent-pulse-empty';
+      placeholder.textContent = 'No active agents';
+      elements.agentPulseStrip.appendChild(placeholder);
+      return;
+    }
+
+    for (const agent of agents) {
+      const name = agent?.name || 'agent';
+      const kind = (agent?.kind || 'ai').toString().toUpperCase();
+      const isJudge = judgeName && judgeName === name;
+      const plannerStatus = plannerStatusByName.get(name) || 'idle';
+      const effectiveStatus = isJudge && judgeStatus !== 'pending' ? judgeStatus : plannerStatus;
+      const toneClass = statusToneClass(effectiveStatus);
+
+      const chip = document.createElement('div');
+      chip.className = `agent-pulse ${toneClass}${isJudge ? ' judge' : ''}${agent?.enabled === false ? ' disabled' : ''}`;
+      chip.setAttribute('title', `${name} (${kind.toLowerCase()}) • ${effectiveStatus}`);
+
+      const badge = document.createElement('span');
+      badge.className = 'agent-pulse-badge';
+      badge.textContent = kind.slice(0, 3);
+
+      const text = document.createElement('span');
+      text.className = 'agent-pulse-text';
+      text.textContent = name;
+
+      chip.appendChild(badge);
+      chip.appendChild(text);
+      elements.agentPulseStrip.appendChild(chip);
     }
   };
 
@@ -410,6 +547,9 @@
         setStatus(elements.keepOpenStatus, status);
       } else if (action === 'models-refresh') {
         setStatus(elements.modelsStatus, status);
+      } else if (action === 'runtime-defaults') {
+        setStatus(elements.runtimeDefaultsStatus, status);
+        fetchState();
       } else if (action === 'agent-add') {
         setStatus(elements.addAgentStatus, status);
         fetchState();
@@ -538,6 +678,23 @@
   if (elements.refreshModelsBtn) {
     elements.refreshModelsBtn.addEventListener('click', () => {
       postAction('/api/models-refresh', {}, elements.modelsStatus);
+    });
+  }
+
+  if (elements.saveRuntimeDefaultsBtn) {
+    elements.saveRuntimeDefaultsBtn.addEventListener('click', () => {
+      const timeoutRaw = Number.parseInt(elements.runtimeTimeout?.value || '180', 10);
+      const minValidRaw = Number.parseInt(elements.runtimeMinValid?.value || '2', 10);
+      const payload = {
+        runtime_defaults: {
+          workflow: elements.runtimeWorkflow?.value || 'full-council',
+          profile: elements.runtimeProfile?.value || 'balanced',
+          timeout_sec: Number.isFinite(timeoutRaw) ? Math.max(30, timeoutRaw) : 180,
+          min_valid_planners: Number.isFinite(minValidRaw) ? Math.max(1, minValidRaw) : 2,
+          plan_only: Boolean(elements.runtimePlanOnly?.checked)
+        }
+      };
+      postAction('/api/runtime-defaults', payload, elements.runtimeDefaultsStatus);
     });
   }
 

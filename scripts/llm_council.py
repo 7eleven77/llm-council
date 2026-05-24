@@ -1421,6 +1421,9 @@ def configure_agents(config_path: Path) -> None:
             "plan_only": plan_only_default,
         }
     )
+    planner_count = max(1, len(planners))
+    if runtime_defaults["min_valid_planners"] > planner_count:
+        runtime_defaults["min_valid_planners"] = planner_count
 
     payload = {"planners": planners, "judge": judge, "runtime_defaults": runtime_defaults}
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2277,11 +2280,18 @@ def main() -> int:
         maximum=16,
     )
     if min_valid_required > len(planners):
+        if args.min_valid_planners is not None:
+            print(
+                f"min-valid-planners ({min_valid_required}) cannot exceed planner count ({len(planners)}).",
+                file=sys.stderr,
+            )
+            return 2
         print(
-            f"min-valid-planners ({min_valid_required}) cannot exceed planner count ({len(planners)}).",
+            f"Configured min-valid-planners ({min_valid_required}) exceeded planner count ({len(planners)}); "
+            f"clamping to {len(planners)} for this run.",
             file=sys.stderr,
         )
-        return 2
+        min_valid_required = len(planners)
 
     if args.seed is not None:
         random.seed(args.seed)

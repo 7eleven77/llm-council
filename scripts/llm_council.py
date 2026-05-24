@@ -1276,7 +1276,38 @@ def refresh_model_catalog(config_data: Dict[str, Any]) -> Dict[str, Any]:
     return {"items": entries, "updated_at": _ui_timestamp()}
 
 
-def configure_agents(config_path: Path) -> None:
+def _agent_kind_display(kind: str) -> str:
+    labels = {
+        "codex": "OpenAI",
+        "claude": "Anthropic",
+        "gemini": "Google",
+        "opencode": "OpenCode",
+        "custom": "Custom",
+    }
+    return labels.get(kind, kind)
+
+
+def _default_api_env_var(kind: str) -> str:
+    defaults = {
+        "codex": "OPENAI_API_KEY",
+        "claude": "ANTHROPIC_API_KEY",
+        "gemini": "GEMINI_API_KEY",
+        "opencode": "OPENCODE_API_KEY",
+        "custom": "CUSTOM_AGENT_API_KEY",
+    }
+    return defaults.get(kind, f"{kind.upper()}_API_KEY")
+
+
+def _save_agents_config(config_path: Path, payload: Dict[str, Any]) -> None:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
+    print(f"\nSaving config to {config_path}.")
+    write_json(str(tmp_path), payload)
+    os.replace(tmp_path, config_path)
+    print("Saved.")
+
+
+def _configure_agents_prompt(config_path: Path) -> None:
     def prompt_text(label: str, default: Optional[str] = None) -> str:
         suffix = f" (default: {default})" if default else ""
         value = input(f"{label}{suffix}: ").strip()
@@ -1309,8 +1340,8 @@ def configure_agents(config_path: Path) -> None:
             print(f"Recommended {kind} models: {', '.join(recommended)}")
         return prompt_text(f"{kind.capitalize()} model", default_model)
 
-    print("Council setup")
-    if prompt_yes_no("Use default council (Codex CLI + Claude CLI + Gemini CLI)?", default_yes=True):
+    print("Council setup (text mode)")
+    if prompt_yes_no("Use recommended default providers (OpenAI + Anthropic + Google)?", default_yes=True):
         planners = [
             {
                 "name": "codex-1",
@@ -1334,9 +1365,16 @@ def configure_agents(config_path: Path) -> None:
         for idx in range(1, planner_count + 1):
             print(f"\nPlanner {idx}")
             kinds = ["codex", "claude", "gemini", "opencode", "custom"]
+            labels = {
+                "codex": "OpenAI",
+                "claude": "Anthropic",
+                "gemini": "Google",
+                "opencode": "OpenCode",
+                "custom": "Custom command",
+            }
             for i, kind in enumerate(kinds, start=1):
-                print(f"{i}) {kind}")
-            choice = prompt_choice("Choose CLI", kinds, default_idx=1)
+                print(f"{i}) {labels.get(kind, kind)}")
+            choice = prompt_choice("Choose provider", kinds, default_idx=1)
             kind = kinds[choice - 1]
 
             default_name = f"{kind}-{idx}"
@@ -1373,7 +1411,7 @@ def configure_agents(config_path: Path) -> None:
                 auth_mode = "login"
             planner["auth_mode"] = auth_mode
             if auth_mode == "api":
-                planner["api_env_var"] = prompt_text("API env var name", f"{kind.upper()}_API_KEY")
+                planner["api_env_var"] = prompt_text("API env var name", _default_api_env_var(kind))
 
             fallback = prompt_text("Fallback model (optional)", "").strip()
             if fallback:
@@ -1426,12 +1464,441 @@ def configure_agents(config_path: Path) -> None:
         runtime_defaults["min_valid_planners"] = planner_count
 
     payload = {"planners": planners, "judge": judge, "runtime_defaults": runtime_defaults}
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
-    print(f"\nSaving config to {config_path}.")
-    write_json(str(tmp_path), payload)
-    os.replace(tmp_path, config_path)
-    print("Saved.")
+    _save_agents_config(config_path, payload)
+
+
+def _supports_setup_tui() -> bool:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return False
+    term = (os.environ.get("TERM") or "").strip().lower()
+    if not term or term == "dumb":
+        return False
+    return True
+
+
+def _configure_agents_tui(config_path: Path) -> None:
+    import curses
+
+    kind_options: List[Tuple[str, str]] = [
+        ("codex", "OpenAI"),
+        ("claude", "Anthropic"),
+        ("gemini", "Google"),
+        ("opencode", "OpenCode"),
+        ("custom", "Custom command"),
+    ]
+    workflow_options: List[Tuple[str, str]] = [
+        ("quick-decide", "quick-decide  (fast, plan-only)"),
+        ("full-council", "full-council  (balanced, full run)"),
+        ("risk-review", "risk-review   (deep, risk-focused)"),
+    ]
+    profile_options: List[Tuple[str, str]] = [
+        ("fast", "fast"),
+        ("balanced", "balanced"),
+        ("deep", "deep"),
+    ]
+
+    class _WizardCancelled(Exception):
+        pass
+
+    def _draw(
+        stdscr: Any,
+        title: str,
+        lines: List[str],
+        *,
+        hint: str = "Up/Down: move  Enter: select  q: quit",
+    ) -> None:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        header = "LLM Council Setup Wizard"
+        stdscr.addnstr(0, 0, header, max(1, width - 1), curses.A_BOLD)
+        stdscr.addnstr(1, 0, title, max(1, width - 1), curses.A_UNDERLINE)
+        row = 3
+        max_row = max(3, height - 3)
+        for line in lines:
+            if row > max_row:
+                break
+            stdscr.addnstr(row, 0, line, max(1, width - 1))
+            row += 1
+        stdscr.addnstr(height - 1, 0, hint, max(1, width - 1), curses.A_DIM)
+        stdscr.refresh()
+
+    def _menu(
+        stdscr: Any,
+        title: str,
+        options: List[str],
+        *,
+        subtitle: str = "",
+        default_idx: int = 0,
+    ) -> int:
+        if not options:
+            raise ValueError("menu options cannot be empty")
+        idx = max(0, min(default_idx, len(options) - 1))
+        while True:
+            menu_lines: List[str] = []
+            if subtitle:
+                menu_lines.append(subtitle)
+                menu_lines.append("")
+            for i, option in enumerate(options):
+                marker = ">" if i == idx else " "
+                menu_lines.append(f"{marker} {option}")
+            _draw(stdscr, title, menu_lines)
+            key = stdscr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                idx = (idx - 1) % len(options)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                idx = (idx + 1) % len(options)
+            elif key in (10, 13, curses.KEY_ENTER):
+                return idx
+            elif key in (ord("q"), 27):
+                raise _WizardCancelled()
+
+    def _pause(stdscr: Any, title: str, message: str) -> None:
+        _draw(stdscr, title, ["", message], hint="Press any key to continue")
+        stdscr.getch()
+
+    def _input_text(
+        stdscr: Any,
+        title: str,
+        label: str,
+        *,
+        default: str = "",
+        allow_empty: bool = False,
+    ) -> str:
+        while True:
+            lines = [f"{label}", ""]
+            if default:
+                lines.append(f"Default: {default}")
+            lines.append("Type a value and press Enter.")
+            lines.append("Leave empty to use default.")
+            _draw(stdscr, title, lines, hint="Enter: submit  q: quit")
+            height, width = stdscr.getmaxyx()
+            prompt = f"{label}: "
+            row = min(height - 2, 8)
+            col = min(len(prompt), max(0, width - 2))
+            stdscr.move(row, 0)
+            stdscr.clrtoeol()
+            stdscr.addnstr(row, 0, prompt, max(1, width - 1))
+            curses.echo()
+            try:
+                curses.curs_set(1)
+            except curses.error:
+                pass
+            raw = stdscr.getstr(row, col, max(1, width - col - 1))
+            curses.noecho()
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+            text = raw.decode("utf-8", errors="replace").strip()
+            if text.lower() in ("q", ":q", "quit", "exit"):
+                raise _WizardCancelled()
+            value = text or default
+            if not value and not allow_empty:
+                _pause(stdscr, title, "Value is required.")
+                continue
+            return value
+
+    def _input_int(
+        stdscr: Any,
+        title: str,
+        label: str,
+        *,
+        default: int,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        while True:
+            raw = _input_text(stdscr, title, label, default=str(default), allow_empty=False)
+            try:
+                value = int(raw)
+            except ValueError:
+                _pause(stdscr, title, f"Invalid number: {raw}")
+                continue
+            if value < minimum or value > maximum:
+                _pause(stdscr, title, f"Choose a value between {minimum} and {maximum}.")
+                continue
+            return value
+
+    def _yes_no(stdscr: Any, title: str, question: str, *, default_yes: bool = True) -> bool:
+        options = ["Yes", "No"] if default_yes else ["No", "Yes"]
+        idx = _menu(stdscr, title, options, subtitle=question, default_idx=0)
+        selected = options[idx].lower()
+        return selected == "yes"
+
+    def _planner_label(planner: Dict[str, Any]) -> str:
+        provider = _agent_kind_display(str(planner.get("kind") or "custom"))
+        name = str(planner.get("name") or "planner")
+        model = str(planner.get("model") or "").strip()
+        if model:
+            return f"{name} ({provider}: {model})"
+        return f"{name} ({provider})"
+
+    def _run(stdscr: Any) -> Dict[str, Any]:
+        stdscr.keypad(True)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
+        _draw(
+            stdscr,
+            "Welcome",
+            [
+                "This wizard configures providers, judge, and runtime defaults.",
+                "",
+                "Provider labels are shown first (OpenAI/Anthropic/Google/OpenCode).",
+            ],
+            hint="Press any key to continue  q: quit",
+        )
+        key = stdscr.getch()
+        if key in (ord("q"), 27):
+            raise _WizardCancelled()
+
+        mode_idx = _menu(
+            stdscr,
+            "Setup Mode",
+            [
+                "Quick setup (recommended): OpenAI + Anthropic + Google",
+                "Custom setup (choose each planner)",
+            ],
+            default_idx=0,
+        )
+
+        if mode_idx == 0:
+            planners: List[Dict[str, Any]] = [
+                {
+                    "name": "codex-1",
+                    "kind": "codex",
+                    "model": CODEX_MODEL,
+                    "reasoning_effort": CODEX_REASONING,
+                    "auth_mode": "login",
+                },
+                {"name": "claude-2", "kind": "claude", "model": CLAUDE_MODEL, "auth_mode": "login"},
+                {"name": "gemini-3", "kind": "gemini", "model": GEMINI_MODEL, "auth_mode": "login"},
+            ]
+            judge = planners[0]
+        else:
+            count = _input_int(
+                stdscr,
+                "Planner Count",
+                "How many planners?",
+                default=3,
+                minimum=2,
+                maximum=12,
+            )
+            planners = []
+            for idx in range(1, count + 1):
+                kind_idx = _menu(
+                    stdscr,
+                    f"Planner {idx} Provider",
+                    [label for _, label in kind_options],
+                    subtitle="Select provider",
+                    default_idx=0,
+                )
+                kind = kind_options[kind_idx][0]
+                default_name = f"{kind}-{idx}"
+                name = _input_text(
+                    stdscr,
+                    f"Planner {idx} Name",
+                    "Planner name",
+                    default=default_name,
+                    allow_empty=False,
+                )
+                planner: Dict[str, Any] = {"name": name, "kind": kind}
+                if kind == "codex":
+                    planner["model"] = _input_text(
+                        stdscr,
+                        f"Planner {idx} Model",
+                        "OpenAI model",
+                        default=CODEX_MODEL,
+                        allow_empty=False,
+                    )
+                    planner["reasoning_effort"] = _input_text(
+                        stdscr,
+                        f"Planner {idx} Reasoning",
+                        "Reasoning effort",
+                        default=CODEX_REASONING,
+                        allow_empty=False,
+                    )
+                elif kind == "claude":
+                    planner["model"] = _input_text(
+                        stdscr,
+                        f"Planner {idx} Model",
+                        "Anthropic model",
+                        default=CLAUDE_MODEL,
+                        allow_empty=False,
+                    )
+                elif kind == "gemini":
+                    planner["model"] = _input_text(
+                        stdscr,
+                        f"Planner {idx} Model",
+                        "Google model",
+                        default=GEMINI_MODEL,
+                        allow_empty=False,
+                    )
+                elif kind == "opencode":
+                    planner["model"] = _input_text(
+                        stdscr,
+                        f"Planner {idx} Model",
+                        "OpenCode provider/model",
+                        default=(RECOMMENDED_MODELS.get("opencode", [""])[0] if RECOMMENDED_MODELS.get("opencode") else ""),
+                        allow_empty=False,
+                    )
+                else:
+                    planner["command"] = _input_text(
+                        stdscr,
+                        f"Planner {idx} Command",
+                        "Custom command",
+                        default="",
+                        allow_empty=False,
+                    )
+                    prompt_mode_idx = _menu(
+                        stdscr,
+                        f"Planner {idx} Prompt Mode",
+                        ["arg", "stdin"],
+                        subtitle="How should prompt be passed to custom command?",
+                        default_idx=0,
+                    )
+                    planner["prompt_mode"] = "stdin" if prompt_mode_idx == 1 else "arg"
+
+                auth_idx = _menu(
+                    stdscr,
+                    f"Planner {idx} Auth",
+                    ["Login/session auth", "API key via env var"],
+                    subtitle="Choose auth mode",
+                    default_idx=0,
+                )
+                planner["auth_mode"] = "api" if auth_idx == 1 else "login"
+                if planner["auth_mode"] == "api":
+                    planner["api_env_var"] = _input_text(
+                        stdscr,
+                        f"Planner {idx} API Key Env",
+                        "Environment variable name",
+                        default=_default_api_env_var(kind),
+                        allow_empty=False,
+                    )
+                fallback = _input_text(
+                    stdscr,
+                    f"Planner {idx} Fallback",
+                    "Fallback model (optional)",
+                    default="",
+                    allow_empty=True,
+                ).strip()
+                if fallback:
+                    planner["fallback_models"] = [fallback]
+                planners.append(planner)
+
+            judge_idx = _menu(
+                stdscr,
+                "Judge Selection",
+                [_planner_label(item) for item in planners],
+                subtitle="Select which planner config should be used as judge",
+                default_idx=0,
+            )
+            judge = planners[judge_idx]
+
+        workflow_idx = _menu(
+            stdscr,
+            "Default Workflow",
+            [label for _, label in workflow_options],
+            default_idx=1,
+        )
+        workflow_default = workflow_options[workflow_idx][0]
+        default_profile = str(_workflow_setting(workflow_default, "profile", "balanced"))
+        profile_default_idx = next(
+            (i for i, (value, _) in enumerate(profile_options) if value == default_profile),
+            1,
+        )
+        profile_idx = _menu(
+            stdscr,
+            "Default Profile",
+            [label for _, label in profile_options],
+            default_idx=profile_default_idx,
+        )
+        profile_default = profile_options[profile_idx][0]
+        timeout_default = _input_int(
+            stdscr,
+            "Default Timeout",
+            "Max timeout seconds",
+            default=DEFAULT_TIMEOUT_SEC,
+            minimum=MIN_TIMEOUT_SEC,
+            maximum=MAX_TIMEOUT_SEC,
+        )
+        min_valid_default = _input_int(
+            stdscr,
+            "Default Min Valid Planners",
+            "Minimum valid planner outputs",
+            default=int(_workflow_setting(workflow_default, "min_valid_planners", 2)),
+            minimum=1,
+            maximum=16,
+        )
+        plan_only_default = _yes_no(
+            stdscr,
+            "Default Run Mode",
+            "Use plan-only mode by default?",
+            default_yes=bool(_workflow_setting(workflow_default, "plan_only", False)),
+        )
+
+        runtime_defaults = _normalize_runtime_defaults(
+            {
+                "workflow": workflow_default,
+                "profile": profile_default,
+                "timeout_sec": timeout_default,
+                "min_valid_planners": min_valid_default,
+                "plan_only": plan_only_default,
+            }
+        )
+        if runtime_defaults["min_valid_planners"] > len(planners):
+            runtime_defaults["min_valid_planners"] = len(planners)
+
+        summary_lines = [
+            f"Config path: {config_path}",
+            "",
+            f"Planners: {len(planners)}",
+        ]
+        for planner in planners:
+            summary_lines.append(f"- {_planner_label(planner)}")
+        summary_lines.extend(
+            [
+                "",
+                f"Judge: {_planner_label(judge)}",
+                "",
+                "Runtime defaults:",
+                f"- workflow: {runtime_defaults['workflow']}",
+                f"- profile: {runtime_defaults['profile']}",
+                f"- timeout_sec: {runtime_defaults['timeout_sec']}",
+                f"- min_valid_planners: {runtime_defaults['min_valid_planners']}",
+                f"- plan_only: {runtime_defaults['plan_only']}",
+            ]
+        )
+        save_idx = _menu(
+            stdscr,
+            "Review and Save",
+            ["Save configuration", "Cancel"],
+            subtitle="\n".join(summary_lines),
+            default_idx=0,
+        )
+        if save_idx != 0:
+            raise _WizardCancelled()
+
+        return {"planners": planners, "judge": judge, "runtime_defaults": runtime_defaults}
+
+    try:
+        payload = curses.wrapper(_run)
+    except _WizardCancelled:
+        print("Setup cancelled.")
+        return
+    _save_agents_config(config_path, payload)
+
+
+def configure_agents(config_path: Path) -> None:
+    if _supports_setup_tui():
+        try:
+            _configure_agents_tui(config_path)
+            return
+        except Exception as exc:
+            print(f"TUI setup unavailable ({exc}). Falling back to text mode.")
+    _configure_agents_prompt(config_path)
 
 
 def build_task_brief(task_spec: Dict[str, Any]) -> str:
@@ -2192,8 +2659,7 @@ def main() -> int:
     except FileNotFoundError:
         print(
             f"Spec file not found: {args.spec}\n"
-            "Uh oh! Your models are not configured. Please run `./setup.sh` to select your models. "
-            "You can override or change these models at any time by running the setup script again.",
+            "Provide a valid task spec JSON path (for example: references/task-spec.example.json).",
             file=sys.stderr,
         )
         return 2

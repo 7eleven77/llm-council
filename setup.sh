@@ -144,6 +144,8 @@ try_npm_install() {
   local cmd="$1"
   shift
   local packages=("$@")
+  local global_prefix=""
+  local can_global_install=0
 
   if has_cmd "$cmd"; then
     log "$cmd found"
@@ -154,12 +156,34 @@ try_npm_install() {
     return 1
   fi
 
+  global_prefix="$(npm config get prefix 2>/dev/null || true)"
+  if [[ -n "$global_prefix" && -w "$global_prefix" ]]; then
+    can_global_install=1
+  fi
+
   local pkg
   for pkg in "${packages[@]}"; do
-    log "Attempting npm install for $cmd via package: $pkg"
-    if npm install -g "$pkg"; then
+    if [[ "$can_global_install" -eq 1 ]]; then
+      log "Attempting npm install for $cmd via package: $pkg"
+      if npm install -g "$pkg"; then
+        if has_cmd "$cmd"; then
+          log "$cmd installed via $pkg"
+          return 0
+        fi
+      fi
+    else
+      warn "No write access to npm global prefix ($global_prefix); using user prefix for $cmd."
+    fi
+    log "Attempting npm install for $cmd via user prefix (~/.local): $pkg"
+    if npm install -g --prefix "$HOME/.local" "$pkg"; then
+      export PATH="$HOME/.local/bin:$PATH"
       if has_cmd "$cmd"; then
-        log "$cmd installed via $pkg"
+        log "$cmd installed via $pkg (user prefix)"
+        return 0
+      fi
+      if [[ -x "$HOME/.local/bin/$cmd" ]]; then
+        log "$cmd installed at $HOME/.local/bin/$cmd"
+        warn "Add '$HOME/.local/bin' to PATH to use $cmd directly in new shells."
         return 0
       fi
     fi
@@ -204,7 +228,15 @@ agent_failures=0
 try_npm_install codex "@openai/codex" || agent_failures=$((agent_failures + 1))
 try_npm_install claude "@anthropic-ai/claude-code" || agent_failures=$((agent_failures + 1))
 try_npm_install gemini "@google/gemini-cli" || agent_failures=$((agent_failures + 1))
-try_npm_install opencode "opencode-ai" "@opencode-ai/cli" || agent_failures=$((agent_failures + 1))
+if ! has_cmd opencode; then
+  if [[ -n "$INSTALLER" ]]; then
+    log "Attempting package-manager install for opencode"
+    install_pkg "$INSTALLER" "opencode" || warn "Package-manager install for opencode failed"
+  fi
+fi
+if ! has_cmd opencode; then
+  try_npm_install opencode "opencode-ai" || agent_failures=$((agent_failures + 1))
+fi
 
 if [[ "$agent_failures" -gt 0 ]]; then
   warn "$agent_failures agent CLI tool(s) are still missing. You can continue with configure and use available/custom agents."

@@ -34,13 +34,13 @@ From repo root:
 `setup.sh` will:
 
 1. Check/install core dependencies (`python3`, `git`, `curl`, `node`, `npm`)
-2. Attempt to install AI CLIs (`codex`, `claude`, `gemini`, `opencode`) via npm packages
+2. Attempt to install AI CLIs (`codex`, `claude`, `gemini`, `opencode`) via package manager and/or npm
 3. Launch interactive configuration
 
 Then run a task:
 
 ```bash
-python3 scripts/llm_council.py run --spec /path/to/task-spec.json
+python3 scripts/llm_council.py run --spec references/task-spec.example.json
 ```
 
 ## Core commands
@@ -51,6 +51,9 @@ Configure agents and runtime defaults:
 python3 scripts/llm_council.py configure
 python3 scripts/llm_council.py configure --config /custom/path/agents.json
 ```
+
+When a TTY is available, `configure` starts a full-screen setup wizard (provider-first UX).  
+If TTY is unavailable, it falls back to text prompts.
 
 Run council:
 
